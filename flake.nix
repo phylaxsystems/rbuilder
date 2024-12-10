@@ -58,16 +58,20 @@
           ] else [
             glibc
             gdb
+            gcc.cc.lib
           ];
 
         commonBuildInputs = with pkgs; [
           openssl
           pkg-config
+          clang
         ] ++ systemSpecific;
 
         commonNativeBuildInputs = with pkgs; [
           rustNightly
           pkg-config
+          gcc
+          clang
         ];
 
       in
@@ -80,6 +84,8 @@
             
             buildInputs = commonBuildInputs;
             nativeBuildInputs = commonNativeBuildInputs;
+
+            LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
 
             cargoLock = {
               lockFile = ./Cargo.lock;
@@ -95,6 +101,8 @@
             buildInputs = commonBuildInputs;
             nativeBuildInputs = commonNativeBuildInputs;
 
+            LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";
+
             cargoLock = {
               lockFile = ./Cargo.lock;
               allowBuiltinFetchGit = true;
@@ -108,6 +116,7 @@
           buildInputs = with pkgs; [
             rustNightly
             rustStable
+            gcc
             clang
             lldb
             gnumake
@@ -119,12 +128,13 @@
           shellHook = ''
             export OLD_PS1="$PS1" # Preserve the original PS1
             export PS1="nix-shell:rbuilder $PS1"
-
+            
             export RUST_BACKTRACE=1
             export RUST_SRC_PATH=${rustNightly}/lib/rustlib/src/rust/library
             
-            export CC=${pkgs.clang}/bin/clang
-            export CXX=${pkgs.clang}/bin/clang++
+            export CC=${pkgs.gcc}/bin/gcc
+            export CXX=${pkgs.gcc}/bin/g++
+            export LIBCLANG_PATH="${pkgs.libclang.lib}/lib"
             
             export PATH=$PATH:$HOME/.cargo/bin
             
@@ -141,7 +151,7 @@
             echo "Nightly Rust toolchain is set as default."
             echo "Use 'rustup override set stable' to switch to stable if needed."
           '';
-          
+
           # reset ps1
           shellExitHook = ''
             export PS1="$OLD_PS1"
