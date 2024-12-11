@@ -6395,6 +6395,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "clap_builder",
+ "eth-bundle-api",
  "jsonrpsee 0.24.7",
  "op-rbuilder-node-optimism",
  "rbuilder",
