@@ -11,6 +11,7 @@ members = [
     "crates/transaction-pool-bundle-ext/bundle_pool_ops/rbuilder",
     "crates/eth-sparse-mpt",
     "crates/eth-bundle-api",
+    "crates/op-rbuilder/node",
 ]
 default-members = ["crates/rbuilder", "crates/reth-rbuilder"]
 resolver = "2"
