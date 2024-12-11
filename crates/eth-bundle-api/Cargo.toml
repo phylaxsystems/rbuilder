@@ -1,13 +1,13 @@
 [package]
-name = "op-rbuilder"
+name = "eth-bundle-api"
+
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 rbuilder = { path = "../rbuilder" }
-op-rbuilder-node-optimism = { path = "./node" }
+op-rbuilder-node-optimism = { path = "../op-rbuilder/node" }
 transaction-pool-bundle-ext = { path = "../transaction-pool-bundle-ext" }
-eth-bundle-api = { path = "../eth-bundle-api" }
 
 reth.workspace = true
 reth-optimism-node.workspace = true
@@ -57,7 +57,3 @@ optimism = [
 redact-sensitive = [
 	"rbuilder/redact-sensitive"
 ]
-
-[[bin]]
-name = "op-rbuilder"
-path = "src/main.rs"

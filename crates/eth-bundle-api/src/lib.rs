@@ -1,6 +1,4 @@
 //! An implemention of the *internal* eth_sendBundle api used by rbuilder.
-//!
-//! Should be refactored into standalone crate if required by other code.
 
 use jsonrpsee::{
     proc_macros::rpc,

@@ -30,9 +30,7 @@
 // The `optimism` feature must be enabled to use this crate.
 #![cfg(feature = "optimism")]
 
-mod eth_bundle_api;
-
-use crate::eth_bundle_api::EthCallBundleMinimalApiServer;
+use eth_bundle_api::EthCallBundleMinimalApiServer;
 use clap_builder::Parser;
 use eth_bundle_api::EthBundleMinimalApi;
 use op_rbuilder_node_optimism::{args::OpRbuilderArgs, OpRbuilderNode};
