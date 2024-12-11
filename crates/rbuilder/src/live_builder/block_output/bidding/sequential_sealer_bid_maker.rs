@@ -106,7 +106,7 @@ impl SequentialSealerBidMakerProcess {
                 Err(error) => error!(
                     block_number,
                     ?error,
-                    "Error on join finalize_block on on SequentialSealerBidMaker"
+                    "Error on join finalize_block on SequentialSealerBidMaker"
                 ),
             }
         }

@@ -95,7 +95,7 @@ where
     }
 
     /// Prepares the context to run a SimulationJob and spawns a task with it.
-    /// The returned SlotOrderSimResults can be polled to the the simulation stream.
+    /// The returned SlotOrderSimResults can be polled to the simulation stream.
     /// IMPORTANT: By calling spawn_simulation_job we lock some worker threads on the given block.
     ///     When we are done we MUST call block_cancellation so the threads can be freed for the next block.
     /// @Pending: Not properly working to be used with several blocks at the same time (forks!).
