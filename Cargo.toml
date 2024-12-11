@@ -9,7 +9,8 @@ members = [
     "crates/rbuilder/src/telemetry/metrics_macros",
     "crates/transaction-pool-bundle-ext",
     "crates/transaction-pool-bundle-ext/bundle_pool_ops/rbuilder",
-    "crates/eth-sparse-mpt"
+    "crates/eth-sparse-mpt",
+    "crates/eth-bundle-api",
 ]
 default-members = ["crates/rbuilder", "crates/reth-rbuilder"]
 resolver = "2"
