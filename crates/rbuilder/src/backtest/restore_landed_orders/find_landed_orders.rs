@@ -78,7 +78,7 @@ impl OrderChunk {
 
         let mut accumulated_chunks = Vec::new();
 
-        let mut prev_element_payed_refund = false;
+        let mut prev_element_paid_refund = false;
         let mut current_chunk_txs = Vec::new();
 
         let release_chunk = |current_chunk_txs: &mut Vec<(B256, TxRevertBehavior)>,
@@ -96,8 +96,8 @@ impl OrderChunk {
         for (idx, body) in inner.body.iter().enumerate() {
             let current_element_pays_refund = !inner.refund.iter().any(|r| r.body_idx == idx);
 
-            if prev_element_payed_refund != current_element_pays_refund {
-                let chunk_refund_percent = if prev_element_payed_refund {
+            if prev_element_paid_refund != current_element_pays_refund {
+                let chunk_refund_percent = if prev_element_paid_refund {
                     total_refund_percent
                 } else {
                     0
@@ -107,7 +107,7 @@ impl OrderChunk {
                     &mut accumulated_chunks,
                     chunk_refund_percent,
                 );
-                prev_element_payed_refund = current_element_pays_refund;
+                prev_element_paid_refund = current_element_pays_refund;
             }
 
             match body {
@@ -115,7 +115,7 @@ impl OrderChunk {
                     current_chunk_txs.push((tx.hash(), tx.revert_behavior));
                 }
                 ShareBundleBody::Bundle(inner_bundle) => {
-                    let chunk_refund_percent = if prev_element_payed_refund {
+                    let chunk_refund_percent = if prev_element_paid_refund {
                         total_refund_percent
                     } else {
                         0
@@ -143,7 +143,7 @@ impl OrderChunk {
             }
         }
 
-        let chunk_refund_percent = if prev_element_payed_refund {
+        let chunk_refund_percent = if prev_element_paid_refund {
             total_refund_percent
         } else {
             0
@@ -735,7 +735,7 @@ mod tests {
     #[test]
     fn test_simplified_order_conversion_bundle() {
         let bundle = Order::Bundle(Bundle {
-            block: 0,
+            block: Some(0),
             min_timestamp: None,
             max_timestamp: None,
             txs: vec![tx(0x01), tx(0x02)],
@@ -745,6 +745,8 @@ mod tests {
             replacement_data: None,
             signer: None,
             metadata: Default::default(),
+            dropping_tx_hashes: Default::default(),
+            refund: Default::default(),
         });
         let expected = SimplifiedOrder::new(
             OrderId::Bundle(uuid::uuid!("00000000-0000-0000-0000-ffff00000002")),

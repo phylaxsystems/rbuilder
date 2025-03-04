@@ -1,12 +1,11 @@
-use alloy_primitives::{Address, Parity, Signature, B256, U256};
-use reth_primitives::{
-    public_key_to_address, Transaction, TransactionSigned, TransactionSignedEcRecovered,
-};
+use alloy_consensus::SignableTransaction;
+use alloy_primitives::{Address, PrimitiveSignature as Signature, B256, U256};
+use reth_primitives::{public_key_to_address, Recovered, Transaction, TransactionSigned};
 use secp256k1::{Message, SecretKey, SECP256K1};
 
 /// Simple struct to sign txs/messages.
 /// Mainly used to sign payout txs from the builder and to create test data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signer {
     pub address: Address,
     pub secret: SecretKey,
@@ -29,7 +28,7 @@ impl Signer {
         let signature = Signature::new(
             U256::try_from_be_slice(&data[..32]).expect("The slice has at most 32 bytes"),
             U256::try_from_be_slice(&data[32..64]).expect("The slice has at most 32 bytes"),
-            Parity::Parity(rec_id.to_i32() != 0),
+            rec_id.to_i32() != 0,
         );
         Ok(signature)
     }
@@ -37,13 +36,10 @@ impl Signer {
     pub fn sign_tx(
         &self,
         tx: Transaction,
-    ) -> Result<TransactionSignedEcRecovered, secp256k1::Error> {
+    ) -> Result<Recovered<TransactionSigned>, secp256k1::Error> {
         let signature = self.sign_message(tx.signature_hash())?;
-        let signed = TransactionSigned::from_transaction_and_signature(tx, signature);
-        Ok(TransactionSignedEcRecovered::from_signed_transaction(
-            signed,
-            self.address,
-        ))
+        let signed = TransactionSigned::new_unhashed(tx, signature);
+        Ok(Recovered::new_unchecked(signed, self.address))
     }
 
     pub fn random() -> Self {
@@ -56,6 +52,7 @@ mod test {
     use super::*;
     use alloy_consensus::TxEip1559;
     use alloy_primitives::{address, fixed_bytes, TxKind as TransactionKind};
+    use reth_node_core::primitives::SignedTransaction;
     #[test]
     fn test_sign_transaction() {
         let secret =
@@ -78,7 +75,7 @@ mod test {
         let signed_tx = signer.sign_tx(tx).expect("sign tx");
         assert_eq!(signed_tx.signer(), address);
 
-        let signed = signed_tx.into_signed();
-        assert_eq!(signed.recover_signer(), Some(address));
+        let signed = signed_tx.into_tx();
+        assert_eq!(signed.recover_signer().ok(), Some(address));
     }
 }

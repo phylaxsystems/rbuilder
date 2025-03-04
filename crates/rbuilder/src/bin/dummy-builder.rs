@@ -10,7 +10,9 @@ use rbuilder::{
     beacon_api_client::Client,
     building::{
         builders::{
-            block_building_helper::{BlockBuildingHelper, BlockBuildingHelperFromProvider},
+            block_building_helper::{
+                BiddableUnfinishedBlock, BlockBuildingHelper, BlockBuildingHelperFromProvider,
+            },
             BlockBuildingAlgorithm, BlockBuildingAlgorithmInput, OrderConsumer,
             UnfinishedBlockBuildingSink, UnfinishedBlockBuildingSinkFactory,
         },
@@ -18,9 +20,10 @@ use rbuilder::{
     },
     live_builder::{
         base_config::{
-            DEFAULT_EL_NODE_IPC_PATH, DEFAULT_INCOMING_BUNDLES_PORT, DEFAULT_IP,
+            default_ip, DEFAULT_EL_NODE_IPC_PATH, DEFAULT_INCOMING_BUNDLES_PORT,
             DEFAULT_RETH_DB_PATH,
         },
+        block_list_provider::NullBlockListProvider,
         config::create_provider_factory,
         order_input::{
             OrderInputConfig, DEFAULT_INPUT_CHANNEL_BUFFER_SIZE, DEFAULT_RESULTS_CHANNEL_TIMEOUT,
@@ -30,18 +33,15 @@ use rbuilder::{
         simulation::SimulatedOrderCommand,
         LiveBuilder,
     },
-    primitives::{
-        mev_boost::{MevBoostRelay, RelayConfig},
-        SimulatedOrder,
-    },
-    roothash::RootHashConfig,
+    mev_boost::RelayClient,
+    primitives::{mev_boost::MevBoostRelaySlotInfoProvider, SimulatedOrder},
+    provider::StateProviderFactory,
     utils::{ProviderFactoryReopener, Signer},
 };
 use reth_chainspec::MAINNET;
-use reth_db::{database::Database, DatabaseEnv};
+use reth_db::DatabaseEnv;
 use reth_node_api::NodeTypesWithDBAdapter;
 use reth_node_ethereum::EthereumNode;
-use reth_provider::{BlockReader, DatabaseProviderFactory, StateProviderFactory};
 use tokio::{
     signal::ctrl_c,
     sync::{broadcast, mpsc},
@@ -62,25 +62,23 @@ async fn main() -> eyre::Result<()> {
     let chain_spec = MAINNET.clone();
     let cancel = CancellationToken::new();
 
-    let relay_config = RelayConfig::default().
-        with_url("https://0xac6e77dfe25ecd6110b8e780608cce0dab71fdd5ebea22a16c0205200f2f8e2e3ad3b71d3499c54ad14d6c21b41a37ae@boost-relay.flashbots.net").
-        with_name("flashbots");
-
-    let relay = MevBoostRelay::from_config(&relay_config)?;
-
+    let flashbots_relay_url = "https://0xac6e77dfe25ecd6110b8e780608cce0dab71fdd5ebea22a16c0205200f2f8e2e3ad3b71d3499c54ad14d6c21b41a37ae@boost-relay.flashbots.net";
+    let relay_client = RelayClient::from_url(flashbots_relay_url.parse()?, None, None, None);
+    let relay = MevBoostRelaySlotInfoProvider::new(relay_client, "flashbots".to_string(), 0);
+    let blocklist_provider = Arc::new(NullBlockListProvider::new());
     let payload_event = MevBoostSlotDataGenerator::new(
         vec![Client::default()],
         vec![relay],
-        Default::default(),
+        blocklist_provider.clone(),
         cancel.clone(),
     );
 
     let order_input_config = OrderInputConfig::new(
         false,
         true,
-        DEFAULT_EL_NODE_IPC_PATH.parse().unwrap(),
+        Some(PathBuf::from(DEFAULT_EL_NODE_IPC_PATH)),
         DEFAULT_INCOMING_BUNDLES_PORT,
-        *DEFAULT_IP,
+        default_ip(),
         DEFAULT_SERVE_MAX_CONNECTIONS,
         DEFAULT_RESULTS_CHANNEL_TIMEOUT,
         DEFAULT_INPUT_CHANNEL_BUFFER_SIZE,
@@ -89,7 +87,6 @@ async fn main() -> eyre::Result<()> {
         mpsc::channel(order_input_config.input_channel_buffer_size);
     let builder = LiveBuilder::<
         ProviderFactoryReopener<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
-        Arc<DatabaseEnv>,
         MevBoostSlotDataGenerator,
     > {
         watchdog_timeout: Some(Duration::from_secs(10000)),
@@ -103,10 +100,11 @@ async fn main() -> eyre::Result<()> {
             None,
             None,
             chain_spec.clone(),
+            None,
         )?,
         coinbase_signer: Signer::random(),
         extra_data: Vec::new(),
-        blocklist: Default::default(),
+        blocklist_provider,
         global_cancellation: cancel.clone(),
         extra_rpc: RpcModule::new(()),
         sink_factory: Box::new(TraceBlockSinkFactory {}),
@@ -114,6 +112,7 @@ async fn main() -> eyre::Result<()> {
         run_sparse_trie_prefetcher: false,
         orderpool_sender,
         orderpool_receiver,
+        sbundle_merger_selected_signers: Default::default(),
     };
 
     let ctrlc = tokio::spawn(async move {
@@ -146,9 +145,9 @@ impl UnfinishedBlockBuildingSinkFactory for TraceBlockSinkFactory {
 struct TracingBlockSink {}
 
 impl UnfinishedBlockBuildingSink for TracingBlockSink {
-    fn new_block(&self, block: Box<dyn BlockBuildingHelper>) {
+    fn new_block(&self, block: BiddableUnfinishedBlock) {
         info!(
-            order_count =? block.built_block_trace().included_orders.len(),
+            order_count =? block.block().built_block_trace().included_orders.len(),
             "Block generated. Throwing it away!"
         );
     }
@@ -166,7 +165,7 @@ impl UnfinishedBlockBuildingSink for TracingBlockSink {
 /// This is a NOT real builder some data is not filled correctly (eg:BuiltBlockTrace)
 #[derive(Debug)]
 struct DummyBuildingAlgorithm {
-    /// Amnount of used orders to build a block
+    /// Amount of used orders to build a block
     orders_to_use: usize,
 }
 
@@ -188,7 +187,7 @@ impl DummyBuildingAlgorithm {
             if cancel.is_cancelled() {
                 break None;
             }
-            order_consumer.consume_next_commands().unwrap();
+            order_consumer.blocking_consume_next_commands().unwrap();
             order_consumer.apply_new_commands(&mut orders_sink);
             let orders = orders_sink.get_orders();
             if orders.len() >= self.orders_to_use {
@@ -198,22 +197,17 @@ impl DummyBuildingAlgorithm {
         }
     }
 
-    fn build_block<P, DB>(
+    fn build_block<P>(
         &self,
         orders: Vec<SimulatedOrder>,
         provider: P,
         ctx: &BlockBuildingContext,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>>
     where
-        DB: Database + Clone + 'static,
-        P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-            + StateProviderFactory
-            + Clone
-            + 'static,
+        P: StateProviderFactory + Clone + 'static,
     {
         let mut block_building_helper = BlockBuildingHelperFromProvider::new(
             provider.clone(),
-            RootHashConfig::live_config(false, false),
             ctx.clone(),
             None,
             BUILDER_NAME.to_string(),
@@ -230,13 +224,9 @@ impl DummyBuildingAlgorithm {
     }
 }
 
-impl<P, DB> BlockBuildingAlgorithm<P, DB> for DummyBuildingAlgorithm
+impl<P> BlockBuildingAlgorithm<P> for DummyBuildingAlgorithm
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + Clone
-        + 'static,
+    P: StateProviderFactory + Clone + 'static,
 {
     fn name(&self) -> String {
         BUILDER_NAME.to_string()
@@ -247,7 +237,9 @@ where
             let block = self
                 .build_block(orders, input.provider, &input.ctx)
                 .unwrap();
-            input.sink.new_block(block);
+            if let Ok(block) = BiddableUnfinishedBlock::new(block) {
+                input.sink.new_block(block);
+            }
         }
     }
 }

@@ -8,24 +8,23 @@
 use clap::{Args, Parser};
 use rbuilder::{
     live_builder::{base_config::load_config_toml_and_env, cli::LiveBuilderConfig, config::Config},
+    provider::reth_prov::StateProviderFactoryFromRethProvider,
     telemetry,
 };
-use reth::{chainspec::EthereumChainSpecParser, cli::Cli};
-use reth_db_api::Database;
-use reth_node_builder::{
-    engine_tree_config::{
-        TreeConfig, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET, DEFAULT_PERSISTENCE_THRESHOLD,
-    },
-    EngineNodeLauncher,
+use reth::{
+    chainspec::{EthereumChainSpecParser, EthereumHardforks},
+    cli::Cli,
+    primitives::Header,
 };
 use reth_node_ethereum::{node::EthereumAddOns, EthereumNode};
 use reth_provider::{
-    providers::{BlockchainProvider, BlockchainProvider2},
-    BlockReader, DatabaseProviderFactory, HeaderProvider, StateProviderFactory,
+    providers::BlockchainProvider, BlockReader, ChainSpecProvider, DatabaseProviderFactory,
+    HeaderProvider, StateCommitmentProvider,
 };
+use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
 use std::{path::PathBuf, process};
 use tokio::task;
-use tracing::{error, info, warn};
+use tracing::error;
 
 // Prefer jemalloc for performance reasons.
 #[cfg(all(feature = "jemalloc", unix))]
@@ -37,25 +36,6 @@ pub struct ExtraArgs {
     /// Path of the rbuilder config to use
     #[arg(long = "rbuilder.config")]
     pub rbuilder_config: PathBuf,
-
-    /// Enable the experimental engine features on reth binary
-    ///
-    /// DEPRECATED: experimental engine is default now, use --engine.legacy to enable the legacy
-    /// functionality
-    #[arg(long = "engine.experimental", default_value = "false")]
-    pub experimental: bool,
-
-    /// Enable the legacy engine on reth binary
-    #[arg(long = "engine.legacy", default_value = "false")]
-    pub legacy: bool,
-
-    /// Configure persistence threshold for engine experimental.
-    #[arg(long = "engine.persistence-threshold", conflicts_with = "legacy", default_value_t = DEFAULT_PERSISTENCE_THRESHOLD)]
-    pub persistence_threshold: u64,
-
-    /// Configure the target number of blocks to keep in memory.
-    #[arg(long = "engine.memory-block-buffer-target", conflicts_with = "legacy", default_value_t = DEFAULT_MEMORY_BLOCK_BUFFER_TARGET)]
-    pub memory_block_buffer_target: u64,
 }
 
 fn main() {
@@ -68,49 +48,21 @@ fn main() {
 
     if let Err(err) =
         Cli::<EthereumChainSpecParser, ExtraArgs>::parse().run(|builder, extra_args| async move {
-            if extra_args.experimental {
-                warn!(target: "reth::cli", "Experimental engine is default now, and the --engine.experimental flag is deprecated. To enable the legacy functionality, use --engine.legacy.");
-            }
-
-            let use_legacy_engine = extra_args.legacy;
-            match use_legacy_engine {
-                false => {
-                    let engine_tree_config = TreeConfig::default()
-                        .with_persistence_threshold(extra_args.persistence_threshold)
-                        .with_memory_block_buffer_target(extra_args.memory_block_buffer_target);
-                    let handle = builder
-                        .with_types_and_provider::<EthereumNode, BlockchainProvider2<_>>()
-                        .with_components(EthereumNode::components())
-                        .with_add_ons(EthereumAddOns::default())
-                        .on_rpc_started(move |ctx, _| {
-                            spawn_rbuilder(ctx.provider().clone(), extra_args.rbuilder_config);
-                            Ok(())
-                        })
-                        .launch_with_fn(|builder| {
-                            let launcher = EngineNodeLauncher::new(
-                                builder.task_executor().clone(),
-                                builder.config().datadir(),
-                                engine_tree_config,
-                            );
-                            builder.launch_with(launcher)
-                        })
-                        .await?;
-                    handle.node_exit_future.await
-                }
-                true => {
-                    info!(target: "reth::cli", "Running with legacy engine");
-                    let handle = builder
-                        .with_types_and_provider::<EthereumNode, BlockchainProvider<_>>()
-                        .with_components(EthereumNode::components())
-                        .with_add_ons::<EthereumAddOns<_>>(Default::default())
-                        .on_rpc_started(move |ctx, _| {
-                            spawn_rbuilder(ctx.provider().clone(), extra_args.rbuilder_config);
-                            Ok(())
-                        })
-                        .launch().await?;
-                    handle.node_exit_future.await
-                }
-            }
+            let handle = builder
+                .with_types_and_provider::<EthereumNode, BlockchainProvider<_>>()
+                .with_components(EthereumNode::components())
+                .with_add_ons(EthereumAddOns::default())
+                .on_node_started(move |node| {
+                    spawn_rbuilder(
+                        node.provider().clone(),
+                        node.pool().clone(),
+                        extra_args.rbuilder_config,
+                    );
+                    Ok(())
+                })
+                .launch()
+                .await?;
+            handle.node_exit_future.await
         })
     {
         eprintln!("Error: {err:?}");
@@ -121,14 +73,19 @@ fn main() {
 /// Spawns a tokio rbuilder task.
 ///
 /// Takes down the entire process if the rbuilder errors or stops.
-fn spawn_rbuilder<P, DB>(provider: P, config_path: PathBuf)
-where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + HeaderProvider
+fn spawn_rbuilder<P>(
+    provider: P,
+    pool: EthTransactionPool<P, DiskFileBlobStore>,
+    config_path: PathBuf,
+) where
+    P: DatabaseProviderFactory<Provider: BlockReader>
+        + reth_provider::StateProviderFactory
+        + HeaderProvider<Header = Header>
+        + StateCommitmentProvider
+        + reth_provider::ChainSpecProvider
         + Clone
         + 'static,
+    <P as ChainSpecProvider>::ChainSpec: EthereumHardforks,
 {
     let _handle = task::spawn(async move {
         let result = async {
@@ -147,8 +104,17 @@ where
                 config.base_config.log_enable_dynamic,
             )
             .await?;
-            let builder = config.new_builder(provider, Default::default()).await?;
 
+            let builder = config
+                .new_builder(
+                    StateProviderFactoryFromRethProvider::new(
+                        provider,
+                        config.base_config().live_root_hash_config()?,
+                    ),
+                    Default::default(),
+                )
+                .await?;
+            builder.connect_to_transaction_pool(pool).await?;
             builder.run().await?;
 
             Ok::<(), eyre::Error>(())

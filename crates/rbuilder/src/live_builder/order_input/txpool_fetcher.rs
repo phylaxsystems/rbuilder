@@ -1,13 +1,13 @@
 use super::{OrderInputConfig, ReplaceableOrderPoolCommand};
 use crate::{
     primitives::{MempoolTx, Order, TransactionSignedEcRecoveredWithBlobs},
-    telemetry::add_txfetcher_time_to_query,
+    telemetry::{add_txfetcher_time_to_query, mark_command_received},
 };
-use alloy_primitives::{hex, Bytes, FixedBytes};
-use alloy_provider::{IpcConnect, Provider, ProviderBuilder, RootProvider};
-use alloy_pubsub::PubSubFrontend;
+use alloy_primitives::FixedBytes;
+use alloy_provider::{IpcConnect, Provider, ProviderBuilder};
 use futures::StreamExt;
 use std::{pin::pin, time::Instant};
+use time::OffsetDateTime;
 use tokio::{
     sync::{mpsc, mpsc::error::SendTimeoutError},
     task::JoinHandle,
@@ -24,7 +24,10 @@ pub async fn subscribe_to_txpool_with_blobs(
     results: mpsc::Sender<ReplaceableOrderPoolCommand>,
     global_cancel: CancellationToken,
 ) -> eyre::Result<JoinHandle<()>> {
-    let ipc = IpcConnect::new(config.ipc_path);
+    let ipc_path = config
+        .ipc_path
+        .ok_or_else(|| eyre::eyre!("No IPC path configured"))?;
+    let ipc = IpcConnect::new(ipc_path);
     let provider = ProviderBuilder::new().on_ipc(ipc).await?;
 
     let handle = tokio::spawn(async move {
@@ -42,6 +45,7 @@ pub async fn subscribe_to_txpool_with_blobs(
         let mut stream = pin!(stream);
 
         while let Some(tx_hash) = stream.next().await {
+            let received_at = OffsetDateTime::now_utc();
             let start = Instant::now();
 
             let tx_with_blobs = match get_tx_with_blobs(tx_hash, &provider).await {
@@ -62,11 +66,10 @@ pub async fn subscribe_to_txpool_with_blobs(
             trace!(order = ?order.id(), parse_duration_mus = parse_duration.as_micros(), "Mempool transaction received with blobs");
             add_txfetcher_time_to_query(parse_duration);
 
+            let orderpool_command = ReplaceableOrderPoolCommand::Order(order);
+            mark_command_received(&orderpool_command, received_at);
             match results
-                .send_timeout(
-                    ReplaceableOrderPoolCommand::Order(order),
-                    config.results_channel_timeout,
-                )
+                .send_timeout(orderpool_command, config.results_channel_timeout)
                 .await
             {
                 Ok(()) => {}
@@ -90,30 +93,19 @@ pub async fn subscribe_to_txpool_with_blobs(
 /// Calls eth_getRawTransactionByHash on EL node and decodes.
 async fn get_tx_with_blobs(
     tx_hash: FixedBytes<32>,
-    provider: &RootProvider<PubSubFrontend>,
+    provider: &impl alloy_provider::Provider,
 ) -> eyre::Result<Option<TransactionSignedEcRecoveredWithBlobs>> {
-    // TODO: Use https://github.com/alloy-rs/alloy/pull/1168 when it gets cut
-    // in a release
-    let raw_tx: Option<String> = provider
-        .client()
-        .request("eth_getRawTransactionByHash", vec![tx_hash])
-        .await?;
-
-    let raw_tx = if let Some(raw_tx) = raw_tx {
-        raw_tx
-    } else {
+    let Some(response) = provider.get_raw_transaction_by_hash(tx_hash).await? else {
         return Ok(None);
     };
-
-    let raw_tx = hex::decode(raw_tx)?;
-    let raw_tx = Bytes::from(raw_tx);
     Ok(Some(
-        TransactionSignedEcRecoveredWithBlobs::decode_enveloped_with_real_blobs(raw_tx)?,
+        TransactionSignedEcRecoveredWithBlobs::decode_enveloped_with_real_blobs(response)?,
     ))
 }
 
 #[cfg(test)]
 mod test {
+
     use super::*;
     use alloy_consensus::{SidecarBuilder, SimpleCoder};
     use alloy_network::{EthereumWallet, TransactionBuilder};
@@ -122,6 +114,7 @@ mod test {
     use alloy_provider::{Provider, ProviderBuilder};
     use alloy_rpc_types::TransactionRequest;
     use alloy_signer_local::PrivateKeySigner;
+    use std::path::PathBuf;
 
     #[tokio::test]
     /// Test that the fetcher can retrieve transactions (both normal and blob) from the txpool
@@ -133,7 +126,10 @@ mod test {
 
         let (sender, mut receiver) = mpsc::channel(10);
         subscribe_to_txpool_with_blobs(
-            OrderInputConfig::default_e2e(),
+            OrderInputConfig {
+                ipc_path: Some(PathBuf::from("/tmp/anvil.ipc")),
+                ..OrderInputConfig::default_e2e()
+            },
             sender,
             CancellationToken::new(),
         )
@@ -144,7 +140,6 @@ mod test {
         let wallet = EthereumWallet::from(signer);
 
         let provider = ProviderBuilder::new()
-            .with_recommended_fillers()
             .wallet(wallet)
             .on_http(anvil.endpoint().parse().unwrap());
 

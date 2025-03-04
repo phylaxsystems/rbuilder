@@ -3,27 +3,28 @@
 use crate::{
     building::builders::UnfinishedBlockBuildingSinkFactory,
     live_builder::{order_input::OrderInputConfig, LiveBuilder},
-    roothash::RootHashConfig,
+    provider::StateProviderFactory,
+    roothash::RootHashContext,
     telemetry::{setup_reloadable_tracing_subscriber, LoggerConfig},
-    utils::{http_provider, BoxedProvider, ProviderFactoryReopener, Signer},
+    utils::{
+        constants::{MINS_PER_HOUR, SECS_PER_MINUTE},
+        http_provider, ProviderFactoryReopener, Signer,
+    },
 };
-use ahash::HashSet;
 use alloy_primitives::{Address, B256};
+use alloy_provider::RootProvider;
+use eth_sparse_mpt::RootHashThreadPool;
 use eyre::{eyre, Context};
 use jsonrpsee::RpcModule;
-use lazy_static::lazy_static;
 use reth::chainspec::chain_value_parser;
 use reth_chainspec::ChainSpec;
-use reth_db::{Database, DatabaseEnv};
+use reth_db::DatabaseEnv;
 use reth_node_api::NodeTypesWithDBAdapter;
 use reth_node_ethereum::EthereumNode;
 use reth_primitives::StaticFileSegment;
-use reth_provider::{
-    DatabaseProviderFactory, HeaderProvider, StateProviderFactory, StaticFileProviderFactory,
-};
+use reth_provider::StaticFileProviderFactory;
 use serde::{Deserialize, Deserializer};
 use serde_with::{serde_as, DeserializeAs};
-use sqlx::PgPool;
 use std::{
     env::var,
     fs::read_to_string,
@@ -34,9 +35,16 @@ use std::{
     time::Duration,
 };
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{error, warn};
+use url::Url;
 
-use super::SlotSource;
+use super::{
+    block_list_provider::{
+        BlockListProvider, HttpBlockListProvider, NullBlockListProvider,
+        StaticFileBlockListProvider,
+    },
+    SlotSource,
+};
 
 /// Prefix for env variables in config
 const ENV_PREFIX: &str = "env:";
@@ -49,9 +57,13 @@ const ENV_PREFIX: &str = "env:";
 #[serde(default, deny_unknown_fields)]
 pub struct BaseConfig {
     pub full_telemetry_server_port: u16,
-    pub full_telemetry_server_ip: Option<String>,
+    #[serde(default = "default_ip")]
+    pub full_telemetry_server_ip: Ipv4Addr,
+
     pub redacted_telemetry_server_port: u16,
-    pub redacted_telemetry_server_ip: Option<String>,
+    #[serde(default = "default_ip")]
+    pub redacted_telemetry_server_ip: Ipv4Addr,
+
     pub log_json: bool,
     log_level: EnvOrValue<String>,
     pub log_color: bool,
@@ -60,13 +72,14 @@ pub struct BaseConfig {
 
     pub error_storage_path: Option<PathBuf>,
 
-    coinbase_secret_key: EnvOrValue<String>,
+    coinbase_secret_key: Option<EnvOrValue<String>>,
 
     pub flashbots_db: Option<EnvOrValue<String>>,
 
-    pub el_node_ipc_path: PathBuf,
+    pub el_node_ipc_path: Option<PathBuf>,
     pub jsonrpc_server_port: u16,
-    pub jsonrpc_server_ip: Option<String>,
+    #[serde(default = "default_ip")]
+    pub jsonrpc_server_ip: Ipv4Addr,
 
     pub ignore_cancellable_orders: bool,
     pub ignore_blobs: bool,
@@ -76,10 +89,31 @@ pub struct BaseConfig {
     pub reth_db_path: Option<PathBuf>,
     pub reth_static_files_path: Option<PathBuf>,
 
+    /// Backwards compatibility. Downloads blocklist from a file.
+    /// Same as setting a file name on blocklist.
     pub blocklist_file_path: Option<PathBuf>,
-    pub extra_data: String,
+
+    /// Can contain an url or a file name.
+    /// If it's a url download blocklist from url and updates periodically.
+    /// If it's a filename just loads the file (no updates).
+    pub blocklist: Option<String>,
+
+    /// If the downloaded file get older than this we abort.
+    pub blocklist_url_max_age_hours: Option<u64>,
+
+    /// Like blocklist_url_max_age_hours but in secs for integration tests.
+    pub blocklist_url_max_age_secs: Option<u64>,
+
+    /// if true will not allow to start without a blocklist or with an empty blocklist.
+    pub require_non_empty_blocklist: Option<bool>,
+
+    #[serde(deserialize_with = "deserialize_extra_data")]
+    pub extra_data: Vec<u8>,
 
     /// mev-share bundles coming from this address are treated in a special way(see [`ShareBundleMerger`])
+    pub sbundle_mergeable_signers: Option<Vec<Address>>,
+
+    /// Backwards compatible typo soon to be removed.
     pub sbundle_mergeabe_signers: Option<Vec<Address>>,
 
     /// Number of threads used for incoming order simulation
@@ -89,6 +123,9 @@ pub struct BaseConfig {
     pub root_hash_use_sparse_trie: bool,
     /// compares result of root hash using sparse trie and reference root hash
     pub root_hash_compare_sparse_trie: bool,
+    /// number of threads used for root hash thread pool
+    /// if 0 global rayon pool is used
+    root_hash_threads: usize,
 
     pub watchdog_timeout_sec: Option<u64>,
 
@@ -106,14 +143,8 @@ pub struct BaseConfig {
     pub backtest_protect_bundle_signers: Vec<Address>,
 }
 
-lazy_static! {
-    pub static ref DEFAULT_IP: Ipv4Addr = Ipv4Addr::new(0, 0, 0, 0);
-}
-
-fn parse_ip(ip: &Option<String>) -> Ipv4Addr {
-    ip.as_ref().map_or(*DEFAULT_IP, |s| {
-        s.parse::<Ipv4Addr>().unwrap_or(*DEFAULT_IP)
-    })
+pub fn default_ip() -> Ipv4Addr {
+    Ipv4Addr::new(0, 0, 0, 0)
 }
 
 /// Loads config from toml file, some values can be loaded from env variables with the following syntax
@@ -155,61 +186,44 @@ impl BaseConfig {
 
     pub fn redacted_telemetry_server_address(&self) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(
-            self.redacted_telemetry_server_ip(),
+            self.redacted_telemetry_server_ip,
             self.redacted_telemetry_server_port,
         ))
     }
 
     pub fn full_telemetry_server_address(&self) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(
-            self.full_telemetry_server_ip(),
+            self.full_telemetry_server_ip,
             self.full_telemetry_server_port,
         ))
     }
 
-    /// WARN: opens reth db
-    pub async fn create_builder<SlotSourceType>(
-        &self,
-        cancellation_token: tokio_util::sync::CancellationToken,
-        sink_factory: Box<dyn UnfinishedBlockBuildingSinkFactory>,
-        slot_source: SlotSourceType,
-    ) -> eyre::Result<
-        super::LiveBuilder<
-            ProviderFactoryReopener<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
-            Arc<DatabaseEnv>,
-            SlotSourceType,
-        >,
-    >
-    where
-        SlotSourceType: SlotSource,
-    {
-        let provider_factory = self.create_provider_factory()?;
-        self.create_builder_with_provider_factory::<ProviderFactoryReopener<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>, Arc<DatabaseEnv>, SlotSourceType>(
-            cancellation_token,
-            sink_factory,
-            slot_source,
-            provider_factory,
-        )
-        .await
+    pub fn root_hash_thread_pool(&self) -> eyre::Result<Option<RootHashThreadPool>> {
+        let root_hash_thread_pool = if self.root_hash_threads > 0 {
+            Some(RootHashThreadPool::try_new(self.root_hash_threads)?)
+        } else {
+            None
+        };
+        Ok(root_hash_thread_pool)
     }
 
     /// Allows instantiating a [`LiveBuilder`] with an existing provider factory
-    pub async fn create_builder_with_provider_factory<P, DB, SlotSourceType>(
+    pub async fn create_builder_with_provider_factory<P, SlotSourceType>(
         &self,
         cancellation_token: tokio_util::sync::CancellationToken,
         sink_factory: Box<dyn UnfinishedBlockBuildingSinkFactory>,
         slot_source: SlotSourceType,
         provider: P,
-    ) -> eyre::Result<super::LiveBuilder<P, DB, SlotSourceType>>
+        blocklist_provider: Arc<dyn BlockListProvider>,
+    ) -> eyre::Result<super::LiveBuilder<P, SlotSourceType>>
     where
-        DB: Database + Clone + 'static,
-        P: DatabaseProviderFactory<DB = DB> + StateProviderFactory + HeaderProvider + Clone,
+        P: StateProviderFactory,
         SlotSourceType: SlotSource,
     {
         let order_input_config = OrderInputConfig::from_config(self)?;
         let (orderpool_sender, orderpool_receiver) =
             mpsc::channel(order_input_config.input_channel_buffer_size);
-        Ok(LiveBuilder::<P, DB, SlotSourceType> {
+        Ok(LiveBuilder::<P, SlotSourceType> {
             watchdog_timeout: self.watchdog_timeout(),
             error_storage_path: self.error_storage_path.clone(),
             simulation_threads: self.simulation_threads,
@@ -219,8 +233,8 @@ impl BaseConfig {
             provider,
 
             coinbase_signer: self.coinbase_signer()?,
-            extra_data: self.extra_data()?,
-            blocklist: self.blocklist()?,
+            extra_data: self.extra_data.clone(),
+            blocklist_provider,
 
             global_cancellation: cancellation_token,
 
@@ -232,36 +246,34 @@ impl BaseConfig {
 
             orderpool_sender,
             orderpool_receiver,
+            sbundle_merger_selected_signers: Arc::new(self.sbundle_mergeable_signers()),
         })
-    }
-
-    pub fn jsonrpc_server_ip(&self) -> Ipv4Addr {
-        parse_ip(&self.jsonrpc_server_ip)
-    }
-
-    pub fn redacted_telemetry_server_ip(&self) -> Ipv4Addr {
-        parse_ip(&self.redacted_telemetry_server_ip)
-    }
-
-    pub fn full_telemetry_server_ip(&self) -> Ipv4Addr {
-        parse_ip(&self.full_telemetry_server_ip)
     }
 
     pub fn chain_spec(&self) -> eyre::Result<Arc<ChainSpec>> {
         chain_value_parser(&self.chain)
     }
 
-    pub fn sbundle_mergeabe_signers(&self) -> Vec<Address> {
-        if self.sbundle_mergeabe_signers.is_none() {
-            warn!("Defaulting sbundle_mergeabe_signers to empty. We may not comply with order flow rules.");
+    pub fn sbundle_mergeable_signers(&self) -> Vec<Address> {
+        if let Some(sbundle_mergeable_signers) = &self.sbundle_mergeable_signers {
+            if self.sbundle_mergeabe_signers.is_some() {
+                error!("sbundle_mergeable_signers and sbundle_mergeabe_signers found. Will use bundle_mergeable_signers");
+            }
+            sbundle_mergeable_signers.clone()
+        } else if let Some(sbundle_mergeable_signers) = &self.sbundle_mergeabe_signers {
+            warn!("sbundle_mergeable_signers missing but found sbundle_mergeabe_signers. sbundle_mergeabe_signers will be used but this will be deprecated soon");
+            sbundle_mergeable_signers.clone()
+        } else {
+            warn!("Defaulting sbundle_mergeable_signers to empty. We may not comply with order flow rules.");
+            Vec::default()
         }
-
-        self.sbundle_mergeabe_signers.clone().unwrap_or_default()
     }
 
     /// Open reth db and DB should be opened once per process but it can be cloned and moved to different threads.
+    /// skip_root_hash -> will create a mock roothasher. Used on backtesting since reth can't compute roothashes on the past.
     pub fn create_provider_factory(
         &self,
+        skip_root_hash: bool,
     ) -> eyre::Result<ProviderFactoryReopener<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>>
     {
         create_provider_factory(
@@ -270,54 +282,134 @@ impl BaseConfig {
             self.reth_static_files_path.as_deref(),
             self.chain_spec()?,
             false,
+            if skip_root_hash {
+                None
+            } else {
+                Some(self.live_root_hash_config()?)
+            },
         )
     }
 
-    pub fn live_root_hash_config(&self) -> eyre::Result<RootHashConfig> {
+    /// live_root_hash_config creates a root hash thread pool
+    /// so it should be called once on the startup and cloned if needed
+    pub fn live_root_hash_config(&self) -> eyre::Result<RootHashContext> {
         if self.root_hash_compare_sparse_trie && !self.root_hash_use_sparse_trie {
             eyre::bail!(
                 "root_hash_compare_sparse_trie can't be set without root_hash_use_sparse_trie"
             );
         }
-        Ok(RootHashConfig::live_config(
+        // temporary guard until reth is fixed
+        if !self.root_hash_use_sparse_trie || self.root_hash_compare_sparse_trie {
+            eyre::bail!("root_hash_use_sparse_trie=true and root_hash_compare_sparse_trie=false must be set, otherwise node will produce incorrect blocks or confusing error messages. These settings are enforced temporarily because upstream parallel root hash implementation is not correct.")
+        }
+        let thread_pool = self.root_hash_thread_pool()?;
+        Ok(RootHashContext::new(
             self.root_hash_use_sparse_trie,
             self.root_hash_compare_sparse_trie,
+            thread_pool,
         ))
     }
 
     pub fn coinbase_signer(&self) -> eyre::Result<Signer> {
-        coinbase_signer_from_secret_key(&self.coinbase_secret_key.value()?)
-    }
-
-    pub fn extra_data(&self) -> eyre::Result<Vec<u8>> {
-        let extra_data = self.extra_data.clone().into_bytes();
-        if extra_data.len() > 32 {
-            return Err(eyre::eyre!("Extra data is too long"));
+        if let Some(secret_key) = &self.coinbase_secret_key {
+            return coinbase_signer_from_secret_key(&secret_key.value()?);
         }
-        Ok(extra_data)
+        warn!("No coinbase secret key provided. A random key will be generated.");
+        warn!(
+            "Caution: If this node wins any block, you wont be able to access the rewards for it."
+        );
+        let new_signer = Signer::random();
+        Ok(new_signer)
     }
 
-    pub fn blocklist(&self) -> eyre::Result<HashSet<Address>> {
-        if let Some(path) = &self.blocklist_file_path {
-            let blocklist_file = read_to_string(path).context("blocklist file")?;
-            let blocklist: Vec<Address> =
-                serde_json::from_str(&blocklist_file).context("blocklist file")?;
-            return Ok(blocklist.into_iter().collect());
+    pub async fn blocklist_provider(
+        &self,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> eyre::Result<Arc<dyn BlockListProvider>> {
+        if self.blocklist.is_some() && self.blocklist_file_path.is_some() {
+            eyre::bail!("You can't use blocklist AND blocklist_file_path")
         }
-        Ok(HashSet::default())
-    }
 
-    pub async fn flashbots_db(&self) -> eyre::Result<Option<PgPool>> {
-        if let Some(url) = &self.flashbots_db {
-            let url = url.value()?;
-            let pool = PgPool::connect(&url).await?;
-            Ok(Some(pool))
-        } else {
-            Ok(None)
+        let require_non_empty_blocklist = self
+            .require_non_empty_blocklist
+            .unwrap_or(DEFAULT_REQUIRE_NON_EMPTY_BLOCKLIST);
+        if self.blocklist_file_path.is_none()
+            && self.blocklist.is_none()
+            && require_non_empty_blocklist
+        {
+            eyre::bail!("require_non_empty_blocklist = true but no blocklist used (blocklist_file_path/blocklist are not set)");
         }
+
+        if let Some(blocklist) = &self.blocklist {
+            // First try url loading
+            match Url::parse(blocklist) {
+                Ok(url) => {
+                    return self
+                        .blocklist_provider_from_url(
+                            url,
+                            require_non_empty_blocklist,
+                            cancellation_token,
+                        )
+                        .await;
+                }
+                Err(_) => {
+                    // second try file loading
+                    return self.blocklist_provider_from_file(
+                        &blocklist.into(),
+                        require_non_empty_blocklist,
+                    );
+                }
+            }
+        }
+
+        // Backwards compatibility
+        if let Some(blocklist_file_path) = &self.blocklist_file_path {
+            warn!("blocklist_file_path is deprecated please use blocklist");
+            return self
+                .blocklist_provider_from_file(blocklist_file_path, require_non_empty_blocklist);
+        }
+
+        // default to empty
+        Ok(Arc::new(NullBlockListProvider::new()))
     }
 
-    pub fn eth_rpc_provider(&self) -> eyre::Result<BoxedProvider> {
+    pub fn blocklist_provider_from_file(
+        &self,
+        blocklist_file_path: &PathBuf,
+        validate_blocklist: bool,
+    ) -> eyre::Result<Arc<dyn BlockListProvider>> {
+        Ok(Arc::new(StaticFileBlockListProvider::new(
+            blocklist_file_path,
+            validate_blocklist,
+        )?))
+    }
+
+    pub async fn blocklist_provider_from_url(
+        &self,
+        blocklist_url: Url,
+        validate_blocklist: bool,
+        cancellation_token: tokio_util::sync::CancellationToken,
+    ) -> eyre::Result<Arc<dyn BlockListProvider>> {
+        let max_allowed_age_secs =
+            if let Some(max_allowed_age_hours) = self.blocklist_url_max_age_hours {
+                max_allowed_age_hours * SECS_PER_MINUTE * MINS_PER_HOUR
+            } else if let Some(blocklist_url_max_age_secs) = self.blocklist_url_max_age_secs {
+                blocklist_url_max_age_secs
+            } else {
+                DEFAULT_BLOCKLIST_URL_MAX_AGE_HOURS * SECS_PER_MINUTE * MINS_PER_HOUR
+            };
+        let max_allowed_age = Duration::from_secs(max_allowed_age_secs);
+        let provider = HttpBlockListProvider::new(
+            blocklist_url,
+            max_allowed_age,
+            validate_blocklist,
+            cancellation_token,
+        )
+        .await?;
+        Ok(Arc::new(provider))
+    }
+
+    pub fn eth_rpc_provider(&self) -> eyre::Result<RootProvider> {
         Ok(http_provider(self.backtest_fetch_eth_rpc_url.parse()?))
     }
 
@@ -414,24 +506,27 @@ pub const DEFAULT_CL_NODE_URL: &str = "http://127.0.0.1:3500";
 pub const DEFAULT_EL_NODE_IPC_PATH: &str = "/tmp/reth.ipc";
 pub const DEFAULT_INCOMING_BUNDLES_PORT: u16 = 8645;
 pub const DEFAULT_RETH_DB_PATH: &str = "/mnt/data/reth";
+/// This will update every 2.4 hours, super reasonable.
+pub const DEFAULT_BLOCKLIST_URL_MAX_AGE_HOURS: u64 = 24;
+pub const DEFAULT_REQUIRE_NON_EMPTY_BLOCKLIST: bool = false;
 
 impl Default for BaseConfig {
     fn default() -> Self {
         Self {
             full_telemetry_server_port: 6069,
-            full_telemetry_server_ip: None,
+            full_telemetry_server_ip: default_ip(),
             redacted_telemetry_server_port: 6070,
-            redacted_telemetry_server_ip: None,
+            redacted_telemetry_server_ip: default_ip(),
             log_json: false,
             log_level: "info".into(),
             log_color: false,
             log_enable_dynamic: false,
             error_storage_path: None,
-            coinbase_secret_key: "".into(),
+            coinbase_secret_key: None,
             flashbots_db: None,
-            el_node_ipc_path: "/tmp/reth.ipc".parse().unwrap(),
+            el_node_ipc_path: None,
             jsonrpc_server_port: DEFAULT_INCOMING_BUNDLES_PORT,
-            jsonrpc_server_ip: None,
+            jsonrpc_server_ip: default_ip(),
             ignore_cancellable_orders: true,
             ignore_blobs: false,
             chain: "mainnet".to_string(),
@@ -439,9 +534,13 @@ impl Default for BaseConfig {
             reth_db_path: None,
             reth_static_files_path: None,
             blocklist_file_path: None,
-            extra_data: "extra_data_change_me".to_string(),
+            blocklist: None,
+            blocklist_url_max_age_hours: None,
+            blocklist_url_max_age_secs: None,
+            extra_data: b"extra_data_change_me".to_vec(),
             root_hash_use_sparse_trie: false,
             root_hash_compare_sparse_trie: false,
+            root_hash_threads: 0,
             watchdog_timeout_sec: None,
             backtest_fetch_mempool_data_dir: "/mnt/data/mempool".into(),
             backtest_fetch_eth_rpc_url: "http://127.0.0.1:8545".to_string(),
@@ -452,18 +551,36 @@ impl Default for BaseConfig {
             backtest_builders: Vec::new(),
             live_builders: vec!["mgp-ordering".to_string(), "mp-ordering".to_string()],
             simulation_threads: 1,
+            sbundle_mergeable_signers: None,
             sbundle_mergeabe_signers: None,
+            require_non_empty_blocklist: Some(DEFAULT_REQUIRE_NON_EMPTY_BLOCKLIST),
         }
     }
 }
 
+fn deserialize_extra_data<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    let bytes = s.into_bytes();
+    if bytes.len() > 32 {
+        return Err(serde::de::Error::custom(
+            "Extra data is too long (max 32 bytes)",
+        ));
+    }
+    Ok(bytes)
+}
+
 /// Open reth db and DB should be opened once per process but it can be cloned and moved to different threads.
+/// root_hash_config None -> MockRootHasher used
 pub fn create_provider_factory(
     reth_datadir: Option<&Path>,
     reth_db_path: Option<&Path>,
     reth_static_files_path: Option<&Path>,
     chain_spec: Arc<ChainSpec>,
     rw: bool,
+    root_hash_config: Option<RootHashContext>,
 ) -> eyre::Result<ProviderFactoryReopener<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>> {
     // shellexpand the reth datadir
     let reth_datadir = if let Some(reth_datadir) = reth_datadir {
@@ -497,7 +614,7 @@ pub fn create_provider_factory(
     };
 
     let provider_factory_reopener =
-        ProviderFactoryReopener::new(db, chain_spec, reth_static_files_path)?;
+        ProviderFactoryReopener::new(db, chain_spec, reth_static_files_path, root_hash_config)?;
 
     if provider_factory_reopener
         .provider_factory_unchecked()
@@ -538,6 +655,7 @@ mod test {
     use reth_node_core::dirs::{DataDirPath, MaybePlatformPath};
     use reth_provider::{providers::StaticFileProvider, ProviderFactory};
     use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn test_default_config() {
@@ -545,6 +663,20 @@ mod test {
         let config_default = BaseConfig::default();
 
         assert_eq!(config, config_default);
+    }
+
+    #[tokio::test]
+    async fn test_require_non_empty_blocklist() {
+        let config = BaseConfig {
+            blocklist: None,
+            blocklist_file_path: None,
+            require_non_empty_blocklist: Some(true),
+            ..Default::default()
+        };
+        assert!(config
+            .blocklist_provider(CancellationToken::new())
+            .await
+            .is_err());
     }
 
     #[test]
@@ -600,6 +732,7 @@ mod test {
                 reth_static_files_path.as_deref(),
                 Default::default(),
                 true,
+                None,
             );
 
             if *should_succeed {

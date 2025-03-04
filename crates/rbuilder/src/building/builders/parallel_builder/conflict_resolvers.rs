@@ -4,7 +4,6 @@ use eyre::Result;
 use itertools::Itertools;
 use rand::{seq::SliceRandom, SeedableRng};
 use reth::{providers::StateProvider, revm::cached::CachedReads};
-use reth_provider::StateProviderFactory;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
@@ -17,6 +16,7 @@ use super::{
 use crate::{
     building::{BlockBuildingContext, BlockState, ExecutionError, ExecutionResult, PartialBlock},
     primitives::{OrderId, SimulatedOrder},
+    provider::StateProviderFactory,
 };
 
 /// Context for resolving conflicts in merging tasks.
@@ -31,7 +31,7 @@ pub struct ResolverContext<P> {
 
 impl<P> ResolverContext<P>
 where
-    P: StateProviderFactory + Clone + 'static,
+    P: StateProviderFactory,
 {
     /// Creates a new `ResolverContext`.
     ///
@@ -466,7 +466,8 @@ mod tests {
     use ahash::HashSet;
     use alloy_consensus::TxLegacy;
     use alloy_primitives::{Address, TxHash, B256, U256};
-    use reth::primitives::{Transaction, TransactionSigned, TransactionSignedEcRecovered};
+    use reth::primitives::TransactionSigned;
+    use reth_primitives::{Recovered, Transaction};
     use uuid::Uuid;
 
     use super::*;
@@ -499,17 +500,17 @@ mod tests {
             TxHash::from(self.create_u256())
         }
 
-        pub fn create_tx(&mut self) -> TransactionSignedEcRecovered {
+        pub fn create_tx(&mut self) -> Recovered<TransactionSigned> {
             let tx_legacy = TxLegacy {
                 nonce: self.create_u64(),
                 ..Default::default()
             };
-            TransactionSignedEcRecovered::from_signed_transaction(
-                TransactionSigned {
-                    hash: self.create_hash(),
-                    transaction: Transaction::Legacy(tx_legacy),
-                    ..Default::default()
-                },
+            Recovered::new_unchecked(
+                TransactionSigned::new(
+                    Transaction::Legacy(tx_legacy),
+                    alloy_primitives::PrimitiveSignature::test_signature(),
+                    self.create_hash(),
+                ),
                 Address::default(),
             )
         }
@@ -534,7 +535,7 @@ mod tests {
             };
 
             let bundle = Bundle {
-                block: 0,
+                block: Some(0),
                 min_timestamp: None,
                 max_timestamp: None,
                 txs,
@@ -544,13 +545,14 @@ mod tests {
                 replacement_data: None,
                 signer: None,
                 metadata: Metadata::default(),
+                dropping_tx_hashes: Vec::new(),
+                refund: None,
             };
 
             SimulatedOrder {
                 order: Order::Bundle(bundle),
                 used_state_trace: None,
                 sim_value,
-                prev_order: None,
             }
         }
     }

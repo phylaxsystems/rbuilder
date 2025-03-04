@@ -1,55 +1,56 @@
-use std::{marker::PhantomData, sync::Arc, time::Duration};
+mod unfinished_block_building_sink_muxer;
+
+use std::{cell::RefCell, rc::Rc, sync::Arc, thread, time::Duration};
 
 use crate::{
     building::{
         builders::{
             BlockBuildingAlgorithm, BlockBuildingAlgorithmInput, UnfinishedBlockBuildingSinkFactory,
         },
-        BlockBuildingContext,
+        multi_share_bundle_merger::MultiShareBundleMerger,
+        simulated_order_command_to_sink, BlockBuildingContext, SimulatedOrderSink,
     },
     live_builder::{payload_events::MevBoostSlotData, simulation::SlotOrderSimResults},
-    roothash::run_trie_prefetcher,
+    primitives::{OrderId, SimulatedOrder},
+    provider::StateProviderFactory,
 };
-use reth_db::Database;
-use reth_provider::{BlockReader, DatabaseProviderFactory, StateProviderFactory};
+use revm_primitives::Address;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
+use unfinished_block_building_sink_muxer::UnfinishedBlockBuildingSinkMuxer;
 
 use super::{
     order_input::{
         self, order_replacement_manager::OrderReplacementManager, orderpool::OrdersForBlock,
     },
     payload_events,
-    simulation::OrderSimulationPool,
+    simulation::{OrderSimulationPool, SimulatedOrderCommand},
 };
 
 #[derive(Debug)]
-pub struct BlockBuildingPool<P, DB> {
+pub struct BlockBuildingPool<P> {
     provider: P,
-    builders: Vec<Arc<dyn BlockBuildingAlgorithm<P, DB>>>,
+    builders: Vec<Arc<dyn BlockBuildingAlgorithm<P>>>,
     sink_factory: Box<dyn UnfinishedBlockBuildingSinkFactory>,
     orderpool_subscriber: order_input::OrderPoolSubscriber,
     order_simulation_pool: OrderSimulationPool<P>,
     run_sparse_trie_prefetcher: bool,
-    phantom: PhantomData<DB>,
+    sbundle_merger_selected_signers: Arc<Vec<Address>>,
 }
 
-impl<P, DB> BlockBuildingPool<P, DB>
+impl<P> BlockBuildingPool<P>
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + Clone
-        + 'static,
+    P: StateProviderFactory + Clone + 'static,
 {
     pub fn new(
         provider: P,
-        builders: Vec<Arc<dyn BlockBuildingAlgorithm<P, DB>>>,
+        builders: Vec<Arc<dyn BlockBuildingAlgorithm<P>>>,
         sink_factory: Box<dyn UnfinishedBlockBuildingSinkFactory>,
         orderpool_subscriber: order_input::OrderPoolSubscriber,
         order_simulation_pool: OrderSimulationPool<P>,
         run_sparse_trie_prefetcher: bool,
+        sbundle_merger_selected_signers: Arc<Vec<Address>>,
     ) -> Self {
         BlockBuildingPool {
             provider,
@@ -58,7 +59,7 @@ where
             orderpool_subscriber,
             order_simulation_pool,
             run_sparse_trie_prefetcher,
-            phantom: PhantomData,
+            sbundle_merger_selected_signers,
         }
     }
 
@@ -83,7 +84,7 @@ where
         let order_replacement_manager = OrderReplacementManager::new(Box::new(sink));
         // sink removal is automatic via OrderSink::is_alive false
         let _block_sub = self.orderpool_subscriber.add_sink(
-            block_ctx.block_env.number.to(),
+            block_ctx.evm_env.block_env.number.to(),
             Box::new(order_replacement_manager),
         );
 
@@ -110,8 +111,9 @@ where
     ) {
         let builder_sink = self.sink_factory.create_sink(slot_data, cancel.clone());
         let (broadcast_input, _) = broadcast::channel(10_000);
+        let muxer = Arc::new(UnfinishedBlockBuildingSinkMuxer::new(builder_sink));
 
-        let block_number = ctx.block_env.number.to::<u64>();
+        let block_number = ctx.evm_env.block_env.number.to::<u64>();
 
         for builder in self.builders.iter() {
             let builder_name = builder.name();
@@ -120,7 +122,7 @@ where
                 provider: self.provider.clone(),
                 ctx: ctx.clone(),
                 input: broadcast_input.subscribe(),
-                sink: builder_sink.clone(),
+                sink: muxer.clone(),
                 cancel: cancel.clone(),
             };
             let builder = builder.clone();
@@ -132,30 +134,77 @@ where
 
         if self.run_sparse_trie_prefetcher {
             let input = broadcast_input.subscribe();
-            let provider = self.provider.clone();
+
             tokio::task::spawn_blocking(move || {
-                run_trie_prefetcher(
-                    ctx.attributes.parent,
-                    ctx.shared_sparse_mpt_cache,
-                    provider,
-                    input,
-                    cancel.clone(),
-                );
-                debug!(block = block_number, "Stopped trie prefetcher job");
+                ctx.root_hasher.run_prefetcher(input, cancel);
             });
         }
 
-        tokio::spawn(multiplex_job(input.orders, broadcast_input));
+        let sbundle_merger_selected_signers = self.sbundle_merger_selected_signers.clone();
+        thread::spawn(move || {
+            merge_and_send(
+                input.orders,
+                broadcast_input,
+                &sbundle_merger_selected_signers,
+            )
+        });
+
+        //        tokio::spawn();
     }
 }
 
-async fn multiplex_job<T>(mut input: mpsc::Receiver<T>, sender: broadcast::Sender<T>) {
+/// Implements SimulatedOrderSink and sends everything to a broadcast::Sender as SimulatedOrderCommand.
+struct SimulatedOrderSinkToChannel {
+    sender: broadcast::Sender<SimulatedOrderCommand>,
+    sender_returned_error: bool,
+}
+
+impl SimulatedOrderSinkToChannel {
+    pub fn new(sender: broadcast::Sender<SimulatedOrderCommand>) -> Self {
+        Self {
+            sender,
+            sender_returned_error: false,
+        }
+    }
+
+    pub fn sender_returned_error(&self) -> bool {
+        self.sender_returned_error
+    }
+}
+
+impl SimulatedOrderSink for SimulatedOrderSinkToChannel {
+    fn insert_order(&mut self, order: SimulatedOrder) {
+        self.sender_returned_error |= self
+            .sender
+            .send(SimulatedOrderCommand::Simulation(order))
+            .is_err()
+    }
+
+    fn remove_order(&mut self, id: OrderId) -> Option<SimulatedOrder> {
+        self.sender_returned_error |= self
+            .sender
+            .send(SimulatedOrderCommand::Cancellation(id))
+            .is_err();
+        None
+    }
+}
+
+/// Merges (see [`MultiShareBundleMerger`]) simulated orders from input and forwards the result to sender.
+fn merge_and_send(
+    mut input: mpsc::Receiver<SimulatedOrderCommand>,
+    sender: broadcast::Sender<SimulatedOrderCommand>,
+    sbundle_merger_selected_signers: &[Address],
+) {
+    let sender = Rc::new(RefCell::new(SimulatedOrderSinkToChannel::new(sender)));
+    let mut merger = MultiShareBundleMerger::new(sbundle_merger_selected_signers, sender.clone());
     // we don't worry about waiting for input forever because it will be closed by producer job
-    while let Some(input) = input.recv().await {
+    while let Some(input) = input.blocking_recv() {
+        simulated_order_command_to_sink(input, &mut merger);
         // we don't create new subscribers to the broadcast so here we can be sure that err means end of receivers
-        if sender.send(input).is_err() {
+        if sender.borrow().sender_returned_error() {
+            trace!("Cancelling merge_and_send job, destination stopped");
             return;
         }
     }
-    trace!("Cancelling multiplex job");
+    trace!("Cancelling merge_and_send job, source stopped");
 }

@@ -1,21 +1,24 @@
 use crate::{
     backtest::BlockData,
     building::{
-        builders::BacktestSimulateBlockInput, sim::simulate_all_orders_with_sim_tree,
-        BlockBuildingContext, BundleErr, OrderErr, TransactionErr,
+        builders::BacktestSimulateBlockInput, multi_share_bundle_merger::MultiShareBundleMerger,
+        sim::simulate_all_orders_with_sim_tree, BlockBuildingContext, BundleErr, OrderErr,
+        SimulatedOrderSink, SimulatedOrderStore, TransactionErr,
     },
     live_builder::cli::LiveBuilderConfig,
     primitives::{OrderId, SimulatedOrder},
+    provider::StateProviderFactory,
     utils::{clean_extradata, Signer},
 };
 use ahash::HashSet;
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, U256};
 use reth::revm::cached::CachedReads;
 use reth_chainspec::ChainSpec;
-use reth_db::Database;
-use reth_provider::{BlockReader, DatabaseProviderFactory, HeaderProvider, StateProviderFactory};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{cell::RefCell, rc::Rc, sync::Arc};
+
+use super::OrdersWithTimestamp;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BacktestBuilderOutput {
@@ -59,25 +62,17 @@ pub fn backtest_prepare_ctx_for_block<P>(
     block_data: BlockData,
     provider: P,
     chain_spec: Arc<ChainSpec>,
-    build_block_lag_ms: i64,
     blocklist: HashSet<Address>,
+    sbundle_mergeabe_signers: &[Address],
     builder_signer: Signer,
 ) -> eyre::Result<BacktestBlockInput>
 where
     P: StateProviderFactory + Clone + 'static,
 {
-    let orders = block_data
-        .available_orders
-        .iter()
-        .filter_map(|order| {
-            if order.timestamp_ms as i64 + build_block_lag_ms
-                >= block_data.winning_bid_trace.timestamp_ms as i64
-            {
-                return None;
-            }
-            Some(order.order.clone())
-        })
-        .collect::<Vec<_>>();
+    let parent_num_hash = BlockNumHash::new(
+        block_data.winning_bid_trace.block_number.saturating_sub(1),
+        block_data.winning_bid_trace.parent_hash,
+    );
     let ctx = BlockBuildingContext::from_onchain_block(
         block_data.onchain_block,
         chain_spec.clone(),
@@ -86,9 +81,40 @@ where
         builder_signer.address,
         block_data.winning_bid_trace.proposer_fee_recipient,
         Some(builder_signer),
+        Arc::from(provider.root_hasher(parent_num_hash)?),
     );
+    backtest_prepare_ctx_for_block_from_building_context(
+        ctx,
+        block_data.available_orders,
+        provider,
+        sbundle_mergeabe_signers,
+    )
+}
+
+pub fn backtest_prepare_ctx_for_block_from_building_context<P>(
+    ctx: BlockBuildingContext,
+    available_orders: Vec<OrdersWithTimestamp>,
+    provider: P,
+    sbundle_mergeabe_signers: &[Address],
+) -> eyre::Result<BacktestBlockInput>
+where
+    P: StateProviderFactory + Clone + 'static,
+{
+    let orders = available_orders
+        .iter()
+        .map(|order| order.order.clone())
+        .collect::<Vec<_>>();
+
     let (sim_orders, sim_errors) =
-        simulate_all_orders_with_sim_tree(provider.clone(), &ctx, &orders, false)?;
+        simulate_all_orders_with_sim_tree(provider, &ctx, &orders, false)?;
+
+    // Apply bundle merging as in live building.
+    let order_store = Rc::new(RefCell::new(SimulatedOrderStore::new()));
+    let mut merger = MultiShareBundleMerger::new(sbundle_mergeabe_signers, order_store.clone());
+    for sim_order in sim_orders {
+        merger.insert_order(sim_order);
+    }
+    let sim_orders = order_store.borrow().get_orders();
     Ok(BacktestBlockInput {
         ctx,
         sim_orders,
@@ -97,23 +123,17 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn backtest_simulate_block<P, DB, ConfigType>(
+pub fn backtest_simulate_block<P, ConfigType>(
     block_data: BlockData,
     provider: P,
     chain_spec: Arc<ChainSpec>,
-    build_block_lag_ms: i64,
     builders_names: Vec<String>,
     config: &ConfigType,
     blocklist: HashSet<Address>,
     sbundle_mergeabe_signers: &[Address],
 ) -> eyre::Result<BlockBacktestValue>
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + HeaderProvider
-        + Clone
-        + 'static,
+    P: StateProviderFactory + Clone + 'static,
     ConfigType: LiveBuilderConfig,
 {
     let BacktestBlockInput {
@@ -124,8 +144,8 @@ where
         block_data.clone(),
         provider.clone(),
         chain_spec.clone(),
-        build_block_lag_ms,
         blocklist,
+        sbundle_mergeabe_signers,
         config.base_config().coinbase_signer()?,
     )?;
 
@@ -166,7 +186,6 @@ where
         let input = BacktestSimulateBlockInput {
             ctx: ctx.clone(),
             builder_name: building_algorithm_name.clone(),
-            sbundle_mergeabe_signers: sbundle_mergeabe_signers.to_vec(),
             sim_orders: &sim_orders,
             provider: provider.clone(),
             cached_reads,

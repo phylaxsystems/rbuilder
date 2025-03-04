@@ -8,11 +8,11 @@ use crate::{
     },
     live_builder::order_input::orderpool::OrdersForBlock,
     primitives::{OrderId, SimulatedOrder},
-    utils::gen_uid,
+    provider::StateProviderFactory,
+    utils::{gen_uid, Signer},
 };
 use ahash::HashMap;
 use parking_lot::Mutex;
-use reth_provider::StateProviderFactory;
 use simulation_job::SimulationJob;
 use std::sync::Arc;
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -107,10 +107,19 @@ where
     ) -> SlotOrderSimResults {
         let (slot_sim_results_sender, slot_sim_results_receiver) = mpsc::channel(10_000);
 
+        let ctx = {
+            // use random coinbase for simulations to make top of the block simulation bypass harder
+            let mut ctx = ctx;
+            let signer = Signer::random();
+            ctx.evm_env.block_env.coinbase = signer.address;
+            ctx.builder_signer = Some(signer);
+            ctx
+        };
+
         let provider = self.provider.clone();
         let current_contexts = Arc::clone(&self.current_contexts);
         let block_context: BlockContextId = gen_uid();
-        let span = info_span!("sim_ctx", block = ctx.block_env.number.to::<u64>(), parent = ?ctx.attributes.parent);
+        let span = info_span!("sim_ctx", block = ctx.evm_env.block_env.number.to::<u64>(), parent = ?ctx.attributes.parent);
 
         let handle = tokio::spawn(
             async move {
@@ -176,9 +185,11 @@ mod tests {
 
         // Create simulation core
         let cancel = CancellationToken::new();
-        let provider_factory_reopener =
-            ProviderFactoryReopener::new_from_existing(test_context.provider_factory().clone())
-                .unwrap();
+        let provider_factory_reopener = ProviderFactoryReopener::new_from_existing(
+            test_context.provider_factory().clone(),
+            None,
+        )
+        .unwrap();
 
         let sim_pool = OrderSimulationPool::new(provider_factory_reopener, 4, cancel.clone());
         let (order_sender, order_receiver) = mpsc::unbounded_channel();

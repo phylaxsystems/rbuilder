@@ -1,4 +1,5 @@
 pub mod base_config;
+pub mod block_list_provider;
 pub mod block_output;
 pub mod building;
 pub mod cli;
@@ -18,25 +19,32 @@ use crate::{
         simulation::OrderSimulationPool,
         watchdog::spawn_watchdog_thread,
     },
-    telemetry::inc_active_slots,
-    utils::{error_storage::spawn_error_storage_writer, Signer},
+    primitives::{MempoolTx, Order, TransactionSignedEcRecoveredWithBlobs},
+    provider::StateProviderFactory,
+    telemetry::{inc_active_slots, mark_building_started, reset_histogram_metrics},
+    utils::{
+        error_storage::spawn_error_storage_writer, provider_head_state::ProviderHeadState, Signer,
+    },
 };
-use ahash::HashSet;
+use alloy_consensus::Header;
 use alloy_primitives::{Address, B256};
+use block_list_provider::BlockListProvider;
 use building::BlockBuildingPool;
 use eyre::Context;
 use jsonrpsee::RpcModule;
 use order_input::ReplaceableOrderPoolCommand;
 use payload_events::MevBoostSlotData;
-use reth::{primitives::Header, providers::HeaderProvider};
+use reth::transaction_pool::{
+    BlobStore, EthPooledTransaction, Pool, TransactionListenerKind, TransactionOrdering,
+    TransactionPool, TransactionValidator,
+};
 use reth_chainspec::ChainSpec;
-use reth_db::Database;
-use reth_provider::{BlockReader, DatabaseProviderFactory, StateProviderFactory};
+use reth_primitives::{Recovered, TransactionSigned};
 use std::{cmp::min, fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct TimingsConfig {
@@ -76,15 +84,18 @@ pub trait SlotSource {
     fn recv_slot_channel(self) -> mpsc::UnboundedReceiver<MevBoostSlotData>;
 }
 
+/// Max headers sent to the cleaning task before the main loop blocks.
+/// Cleaning task is super fast so it should never lag behind block building, even 1 should be enough, 10 is super safe.
+const CLEAN_TASKS_CHANNEL_SIZE: usize = 10;
+
 /// Main builder struct.
 /// Connects to the CL, get the new slots and builds blocks for each slot.
 /// # Usage
 /// Create and run()
 #[derive(Debug)]
-pub struct LiveBuilder<P, DB, BlocksSourceType>
+pub struct LiveBuilder<P, BlocksSourceType>
 where
-    DB: Database + Clone + 'static,
-    P: StateProviderFactory + Clone,
+    P: StateProviderFactory,
     BlocksSourceType: SlotSource,
 {
     pub watchdog_timeout: Option<Duration>,
@@ -99,39 +110,38 @@ where
 
     pub coinbase_signer: Signer,
     pub extra_data: Vec<u8>,
-    pub blocklist: HashSet<Address>,
+    pub blocklist_provider: Arc<dyn BlockListProvider>,
 
     pub global_cancellation: CancellationToken,
 
     pub sink_factory: Box<dyn UnfinishedBlockBuildingSinkFactory>,
-    pub builders: Vec<Arc<dyn BlockBuildingAlgorithm<P, DB>>>,
+    pub builders: Vec<Arc<dyn BlockBuildingAlgorithm<P>>>,
     pub extra_rpc: RpcModule<()>,
 
     /// Notify rbuilder of new [`ReplaceableOrderPoolCommand`] flow via this channel.
     pub orderpool_sender: mpsc::Sender<ReplaceableOrderPoolCommand>,
     pub orderpool_receiver: mpsc::Receiver<ReplaceableOrderPoolCommand>,
+    pub sbundle_merger_selected_signers: Arc<Vec<Address>>,
 }
 
-impl<P, DB, BlocksSourceType: SlotSource> LiveBuilder<P, DB, BlocksSourceType>
+impl<P, BlocksSourceType: SlotSource> LiveBuilder<P, BlocksSourceType>
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + HeaderProvider
-        + Clone
-        + 'static,
+    P: StateProviderFactory + Clone + 'static,
     BlocksSourceType: SlotSource,
 {
     pub fn with_extra_rpc(self, extra_rpc: RpcModule<()>) -> Self {
         Self { extra_rpc, ..self }
     }
 
-    pub fn with_builders(self, builders: Vec<Arc<dyn BlockBuildingAlgorithm<P, DB>>>) -> Self {
+    pub fn with_builders(self, builders: Vec<Arc<dyn BlockBuildingAlgorithm<P>>>) -> Self {
         Self { builders, ..self }
     }
 
     pub async fn run(self) -> eyre::Result<()> {
-        info!("Builder block list size: {}", self.blocklist.len(),);
+        info!(
+            "Builder initial block list size: {}",
+            self.blocklist_provider.get_blocklist()?.len(),
+        );
         info!(
             "Builder coinbase address: {:?}",
             self.coinbase_signer.address
@@ -147,6 +157,8 @@ where
         let mut inner_jobs_handles = Vec::new();
         let mut payload_events_channel = self.blocks_source.recv_slot_channel();
 
+        let (header_sender, header_receiver) = mpsc::channel(CLEAN_TASKS_CHANNEL_SIZE);
+
         let orderpool_subscriber = {
             let (handle, sub) = start_orderpool_jobs(
                 self.order_input_config,
@@ -155,6 +167,7 @@ where
                 self.global_cancellation.clone(),
                 self.orderpool_sender,
                 self.orderpool_receiver,
+                header_receiver,
             )
             .await?;
             inner_jobs_handles.push(handle);
@@ -176,10 +189,14 @@ where
             orderpool_subscriber,
             order_simulation_pool,
             self.run_sparse_trie_prefetcher,
+            self.sbundle_merger_selected_signers.clone(),
         );
 
         let watchdog_sender = match self.watchdog_timeout {
-            Some(duration) => Some(spawn_watchdog_thread(duration)?),
+            Some(duration) => Some(spawn_watchdog_thread(
+                duration,
+                "block build started".to_string(),
+            )?),
             None => {
                 info!("Watchdog not enabled");
                 None
@@ -187,21 +204,28 @@ where
         };
 
         while let Some(payload) = payload_events_channel.recv().await {
-            if self.blocklist.contains(&payload.fee_recipient()) {
+            reset_histogram_metrics();
+
+            let blocklist = self.blocklist_provider.get_blocklist()?;
+            if blocklist.contains(&payload.fee_recipient()) {
                 warn!(
                     slot = payload.slot(),
-                    "Fee recipient is in blocklist: {:?}",
-                    payload.fee_recipient()
+                    fee_recipient = ?payload.fee_recipient(),
+                    "Fee recipient is in blocklist"
                 );
                 continue;
             }
+            let current_time = OffsetDateTime::now_utc();
             // see if we can get parent header in a reasonable time
-
-            let time_to_slot = payload.timestamp() - OffsetDateTime::now_utc();
+            let time_to_slot = payload.timestamp() - current_time;
             debug!(
                 slot = payload.slot(),
                 block = payload.block(),
+                ?current_time,
+                payload_timestamp = ?payload.timestamp(),
                 ?time_to_slot,
+                parent_hash = ?payload.parent_block_hash(),
+                provider_head_state = ?ProviderHeadState::new(&self.provider),
                 "Received payload, time till slot timestamp",
             );
 
@@ -209,6 +233,7 @@ where
             if time_until_slot_end.is_negative() {
                 warn!(
                     slot = payload.slot(),
+                    parent_hash = ?payload.parent_block_hash(),
                     "Slot already ended, skipping block building"
                 );
                 continue;
@@ -222,7 +247,7 @@ where
                 {
                     Ok(header) => header,
                     Err(err) => {
-                        warn!("Failed to get parent header for new slot: {:?}", err);
+                        warn!(parent_hash = ?payload.parent_block_hash(), ?err, "Failed to get parent header for new slot");
                         continue;
                     }
                 }
@@ -231,28 +256,38 @@ where
             debug!(
                 slot = payload.slot(),
                 block = payload.block(),
+                parent_hash = ?payload.parent_block_hash(),
                 "Got header for slot"
             );
 
+            // notify the order pool that there is a new header
+            if let Err(err) = header_sender.send(parent_header.clone()).await {
+                warn!(?err, "Failed to send header to builder pool");
+            }
+
             inc_active_slots();
+
+            let root_hasher =
+                Arc::from(self.provider.root_hasher(payload.parent_block_num_hash())?);
 
             if let Some(block_ctx) = BlockBuildingContext::from_attributes(
                 payload.payload_attributes_event.clone(),
                 &parent_header,
-                self.coinbase_signer.clone(),
+                self.coinbase_signer,
                 self.chain_chain_spec.clone(),
-                self.blocklist.clone(),
+                blocklist.clone(),
                 Some(payload.suggested_gas_limit),
                 self.extra_data.clone(),
                 None,
+                root_hasher,
             ) {
+                mark_building_started(block_ctx.timestamp());
                 builder_pool.start_block_building(
                     payload,
                     block_ctx,
                     self.global_cancellation.clone(),
                     time_until_slot_end.try_into().unwrap_or_default(),
                 );
-
                 if let Some(watchdog_sender) = watchdog_sender.as_ref() {
                     watchdog_sender.try_send(()).unwrap_or_default();
                 };
@@ -264,9 +299,46 @@ where
         for handle in inner_jobs_handles {
             handle
                 .await
-                .map_err(|err| warn!("Job handle await error: {:?}", err))
+                .map_err(|err| warn!(?err, "Job handle await error"))
                 .unwrap_or_default();
         }
+        Ok(())
+    }
+
+    /// Connect the builder to a reth [`TransactionPool`].
+    ///
+    /// This will
+    /// 1. Add pending and queued transactions to the [`OrderPool`]
+    /// 2. Subscribe to the pool directly, so the builder is not reliant on
+    ///    IPC to be notified of new transactions.
+    pub async fn connect_to_transaction_pool<V, T, S>(
+        &self,
+        pool: Pool<V, T, S>,
+    ) -> Result<(), eyre::Error>
+    where
+        V: TransactionValidator<Transaction = EthPooledTransaction> + 'static,
+        T: TransactionOrdering<Transaction = <V as TransactionValidator>::Transaction>,
+        S: BlobStore,
+    {
+        // Initialize the orderpool with every item in the reth pool.
+        for tx in pool
+            .all_transactions()
+            .pending_recovered()
+            .chain(pool.all_transactions().queued_recovered())
+        {
+            try_send_to_orderpool(tx, self.orderpool_sender.clone(), pool.clone()).await;
+        }
+
+        // Subscribe to new transactions in-process.
+        let mut recv = pool.new_transactions_listener_for(TransactionListenerKind::All);
+        let orderpool_sender = self.orderpool_sender.clone();
+        tokio::spawn(async move {
+            while let Some(e) = recv.recv().await {
+                let tx = e.transaction.transaction.transaction().clone();
+                try_send_to_orderpool(tx, orderpool_sender.clone(), pool.clone()).await;
+            }
+        });
+
         Ok(())
     }
 
@@ -286,11 +358,11 @@ where
 async fn wait_for_block_header<P>(
     block: B256,
     slot_time: OffsetDateTime,
-    provider: P,
+    provider: &P,
     timings: &TimingsConfig,
 ) -> eyre::Result<Header>
 where
-    P: HeaderProvider,
+    P: StateProviderFactory,
 {
     let deadline = slot_time + timings.block_header_deadline_delta;
     while OffsetDateTime::now_utc() < deadline {
@@ -308,4 +380,32 @@ where
         }
     }
     Err(eyre::eyre!("Block header not found"))
+}
+
+/// Attempts to forward a [`Recovered<TransactionSigned>`] to an orderpool.
+///
+/// Helper for [`LiveBuilder::connect_to_transaction_pool`].
+///
+/// Errors are handled internally with a log.
+async fn try_send_to_orderpool<V, T, S>(
+    tx: Recovered<TransactionSigned>,
+    orderpool_sender: mpsc::Sender<ReplaceableOrderPoolCommand>,
+    pool: Pool<V, T, S>,
+) where
+    V: TransactionValidator<Transaction = EthPooledTransaction> + 'static,
+    T: TransactionOrdering<Transaction = <V as TransactionValidator>::Transaction>,
+    S: BlobStore,
+{
+    match TransactionSignedEcRecoveredWithBlobs::try_from_tx_without_blobs_and_pool(tx, pool) {
+        Ok(tx) => {
+            let order = Order::Tx(MempoolTx::new(tx));
+            let command = ReplaceableOrderPoolCommand::Order(order);
+            if let Err(e) = orderpool_sender.send(command).await {
+                error!("Error sending order to orderpool: {:#}", e);
+            }
+        }
+        Err(e) => {
+            error!("Error creating order from transaction: {:#}", e);
+        }
+    }
 }

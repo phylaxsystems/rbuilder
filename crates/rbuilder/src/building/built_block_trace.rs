@@ -1,8 +1,8 @@
 use super::{BundleErr, ExecutionError, ExecutionResult, OrderErr};
 use crate::primitives::{Order, OrderId, OrderReplacementKey};
-use ahash::{HashMap, HashSet};
+use ahash::{AHasher, HashMap, HashSet};
 use alloy_primitives::{Address, TxHash, U256};
-use std::{collections::hash_map, time::Duration};
+use std::{collections::hash_map, hash::Hasher, time::Duration};
 use time::OffsetDateTime;
 
 /// Structs for recording data about a built block, such as what bundles were included, and where txs came from.
@@ -13,15 +13,21 @@ pub struct BuiltBlockTrace {
     pub included_orders: Vec<ExecutionResult>,
     /// How much we bid (pay to the validator)
     pub bid_value: U256,
+    /// coinbase balance delta before the payout tx.
+    pub coinbase_reward: U256,
     /// True block value (coinbase balance delta) excluding the cost of the payout to validator
     pub true_bid_value: U256,
     /// Some bundle failed with BundleErr::NoSigner, we might want to switch to !use_suggested_fee_recipient_as_coinbase
     pub got_no_signer_error: bool,
+    /// Timestamp of the moment we stopped considering new orders for this block.
     pub orders_closed_at: OffsetDateTime,
+    /// Timestamp when this block was fully sealed and ready for submission.
     pub orders_sealed_at: OffsetDateTime,
     pub fill_time: Duration,
     pub finalize_time: Duration,
     pub root_hash_time: Duration,
+    /// Value we saw in the competition when we decided to make this bid.
+    pub seen_competition_bid: Option<U256>,
 }
 
 impl Default for BuiltBlockTrace {
@@ -49,6 +55,7 @@ impl BuiltBlockTrace {
         Self {
             included_orders: Vec::new(),
             bid_value: U256::from(0),
+            coinbase_reward: U256::from(0),
             true_bid_value: U256::from(0),
             got_no_signer_error: false,
             orders_closed_at: OffsetDateTime::now_utc(),
@@ -56,13 +63,13 @@ impl BuiltBlockTrace {
             fill_time: Duration::from_secs(0),
             finalize_time: Duration::from_secs(0),
             root_hash_time: Duration::from_secs(0),
+            seen_competition_bid: None,
         }
     }
 
     /// Should be called after block is sealed
     /// Sets:
     /// orders_sealed_at to the current time
-    /// orders_closed_at to the given time
     pub fn update_orders_sealed_at(&mut self) {
         self.orders_sealed_at = OffsetDateTime::now_utc();
     }
@@ -159,5 +166,17 @@ impl BuiltBlockTrace {
         }
 
         Ok(())
+    }
+
+    /// Generates a cheap hash to identify the tx content.
+    pub fn transactions_hash(&self) -> u64 {
+        let mut hasher = AHasher::default();
+        for execution_result in &self.included_orders {
+            for tx in &execution_result.txs {
+                let tx_hash = tx.hash();
+                hasher.write(tx_hash.as_slice());
+            }
+        }
+        hasher.finish()
     }
 }

@@ -33,12 +33,9 @@ use crate::{
         BacktestSimulateBlockInput, Block, BlockBuildingAlgorithm, BlockBuildingAlgorithmInput,
         LiveBuilderInput,
     },
-    roothash::RootHashConfig,
+    provider::StateProviderFactory,
 };
-use alloy_primitives::Address;
 use reth::revm::cached::CachedReads;
-use reth_db::database::Database;
-use reth_provider::{BlockReader, DatabaseProviderFactory, StateProviderFactory};
 
 use self::{
     block_building_result_assembler::BlockBuildingResultAssembler,
@@ -73,26 +70,22 @@ fn get_shared_data_structures() -> (Arc<BestResults>, TaskQueue) {
     (best_results, task_queue)
 }
 
-struct ParallelBuilder<P, DB> {
+struct ParallelBuilder<P> {
     order_intake_consumer: OrderIntakeStore,
     conflict_finder: ConflictFinder,
     conflict_task_generator: ConflictTaskGenerator,
     conflict_resolving_pool: ConflictResolvingPool<P>,
     results_aggregator: ResultsAggregator,
-    block_building_result_assembler: BlockBuildingResultAssembler<P, DB>,
+    block_building_result_assembler: BlockBuildingResultAssembler<P>,
 }
 
-impl<P, DB> ParallelBuilder<P, DB>
+impl<P> ParallelBuilder<P>
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + Clone
-        + 'static,
+    P: StateProviderFactory + Clone + 'static,
 {
     /// Creates a ParallelBuilder.
     /// Sets up the various components and communication channels.
-    pub fn new(input: LiveBuilderInput<P, DB>, config: &ParallelBuilderConfig) -> Self {
+    pub fn new(input: LiveBuilderInput<P>, config: &ParallelBuilderConfig) -> Self {
         let (group_result_sender, group_result_receiver) = get_communication_channels();
         let group_result_sender_for_task_generator = group_result_sender.clone();
 
@@ -122,7 +115,6 @@ where
 
         let block_building_result_assembler = BlockBuildingResultAssembler::new(
             config,
-            input.root_hash_config,
             Arc::clone(&best_results),
             input.provider.clone(),
             input.ctx.clone(),
@@ -132,8 +124,7 @@ where
             Some(input.sink.clone()),
         );
 
-        let order_intake_consumer =
-            OrderIntakeStore::new(input.input, &input.sbundle_mergeabe_signers);
+        let order_intake_consumer = OrderIntakeStore::new(input.input);
 
         Self {
             order_intake_consumer,
@@ -183,13 +174,9 @@ where
 ///
 /// # Type Parameters
 /// * `DB`: The database type, which must implement Database, Clone, and have a static lifetime.
-pub fn run_parallel_builder<P, DB>(input: LiveBuilderInput<P, DB>, config: &ParallelBuilderConfig)
+pub fn run_parallel_builder<P>(input: LiveBuilderInput<P>, config: &ParallelBuilderConfig)
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + Clone
-        + 'static,
+    P: StateProviderFactory + Clone + 'static,
 {
     let cancel_for_results_aggregator = input.cancel.clone();
     let cancel_for_block_building_result_assembler = input.cancel.clone();
@@ -250,7 +237,7 @@ fn run_order_intake(
             }
         }
 
-        let new_orders = order_intake_consumer.drain_new_orders();
+        let new_orders = order_intake_consumer.try_drain_new_orders_if_no_cancellations();
 
         // We can update conflict_finder if we have ONLY adds
         if let Some(new_orders) = new_orders {
@@ -270,16 +257,12 @@ fn run_order_intake(
     }
 }
 
-pub fn parallel_build_backtest<P, DB>(
+pub fn parallel_build_backtest<P>(
     input: BacktestSimulateBlockInput<'_, P>,
     config: ParallelBuilderConfig,
 ) -> Result<(Block, CachedReads)>
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + Clone
-        + 'static,
+    P: StateProviderFactory + Clone + 'static,
 {
     let start_time = Instant::now();
 
@@ -331,7 +314,6 @@ where
     let assembler_start = Instant::now();
     let block_building_result_assembler = BlockBuildingResultAssembler::new(
         &config,
-        RootHashConfig::skip_root_hash(),
         Arc::clone(&best_results),
         input.provider.clone(),
         input.ctx.clone(),
@@ -363,7 +345,7 @@ where
     } else {
         Some(block_building_helper.true_block_value()?)
     };
-    let finalize_block_result = block_building_helper.finalize_block(payout_tx_value)?;
+    let finalize_block_result = block_building_helper.finalize_block(payout_tx_value, None)?;
     let building_duration = building_start.elapsed();
     let total_duration = start_time.elapsed();
 
@@ -383,35 +365,19 @@ where
 
 #[derive(Debug)]
 pub struct ParallelBuildingAlgorithm {
-    root_hash_config: RootHashConfig,
-    sbundle_mergeabe_signers: Vec<Address>,
     config: ParallelBuilderConfig,
     name: String,
 }
 
 impl ParallelBuildingAlgorithm {
-    pub fn new(
-        root_hash_config: RootHashConfig,
-        sbundle_mergeabe_signers: Vec<Address>,
-        config: ParallelBuilderConfig,
-        name: String,
-    ) -> Self {
-        Self {
-            root_hash_config,
-            sbundle_mergeabe_signers,
-            config,
-            name,
-        }
+    pub fn new(config: ParallelBuilderConfig, name: String) -> Self {
+        Self { config, name }
     }
 }
 
-impl<P, DB> BlockBuildingAlgorithm<P, DB> for ParallelBuildingAlgorithm
+impl<P> BlockBuildingAlgorithm<P> for ParallelBuildingAlgorithm
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + Clone
-        + 'static,
+    P: StateProviderFactory + Clone + 'static,
 {
     fn name(&self) -> String {
         self.name.clone()
@@ -420,14 +386,11 @@ where
     fn build_blocks(&self, input: BlockBuildingAlgorithmInput<P>) {
         let live_input = LiveBuilderInput {
             provider: input.provider,
-            root_hash_config: self.root_hash_config.clone(),
             ctx: input.ctx.clone(),
             input: input.input,
             sink: input.sink,
             builder_name: self.name.clone(),
             cancel: input.cancel,
-            sbundle_mergeabe_signers: self.sbundle_mergeabe_signers.clone(),
-            phantom: Default::default(),
         };
         run_parallel_builder(live_input, &self.config);
     }

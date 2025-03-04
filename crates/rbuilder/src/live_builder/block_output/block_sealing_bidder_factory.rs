@@ -1,17 +1,19 @@
 use crate::{
-    building::builders::{UnfinishedBlockBuildingSink, UnfinishedBlockBuildingSinkFactory},
+    building::builders::{
+        block_building_helper::BiddableUnfinishedBlock, UnfinishedBlockBuildingSink,
+        UnfinishedBlockBuildingSinkFactory,
+    },
     live_builder::payload_events::MevBoostSlotData,
+    provider::StateProviderFactory,
 };
 use alloy_primitives::U256;
-use reth_provider::{HeaderProvider, StateProviderFactory};
 use std::{fmt::Debug, sync::Arc};
 use tracing::error;
 
 use super::{
     bid_value_source::interfaces::{BidValueObs, BidValueSource},
     bidding::{
-        interfaces::{BidMaker, BiddingService, SlotBidder},
-        parallel_sealer_bid_maker::ParallelSealerBidMaker,
+        interfaces::{BiddingService, SlotBidder},
         sequential_sealer_bid_maker::SequentialSealerBidMaker,
         wallet_balance_watcher::WalletBalanceWatcher,
     },
@@ -31,8 +33,6 @@ pub struct BlockSealingBidderFactory<P> {
     /// SlotBidder are subscribed to the proper block in the bid_value_source.
     competition_bid_value_source: Arc<dyn BidValueSource + Send + Sync>,
     wallet_balance_watcher: WalletBalanceWatcher<P>,
-    /// See [ParallelSealerBidMaker]
-    max_concurrent_seals: usize,
 }
 
 impl<P> Debug for BlockSealingBidderFactory<P> {
@@ -44,7 +44,6 @@ impl<P> Debug for BlockSealingBidderFactory<P> {
                 "competition_bid_value_source",
                 &self.competition_bid_value_source,
             )
-            .field("max_concurrent_seals", &self.max_concurrent_seals)
             .finish()
     }
 }
@@ -55,14 +54,12 @@ impl<P> BlockSealingBidderFactory<P> {
         block_sink_factory: Box<dyn BuilderSinkFactory>,
         competition_bid_value_source: Arc<dyn BidValueSource + Send + Sync>,
         wallet_balance_watcher: WalletBalanceWatcher<P>,
-        max_concurrent_seals: usize,
     ) -> Self {
         Self {
             bidding_service,
             block_sink_factory,
             competition_bid_value_source,
             wallet_balance_watcher,
-            max_concurrent_seals,
         }
     }
 }
@@ -81,7 +78,7 @@ impl BidValueObs for SlotBidderToBidValueObs {
 
 impl<P> UnfinishedBlockBuildingSinkFactory for BlockSealingBidderFactory<P>
 where
-    P: StateProviderFactory + HeaderProvider,
+    P: StateProviderFactory,
 {
     fn create_sink(
         &mut self,
@@ -107,18 +104,10 @@ where
             self.competition_bid_value_source.clone(),
             cancel.clone(),
         );
-        let sealer: Box<dyn BidMaker + Send + Sync> = if self.max_concurrent_seals == 1 {
-            Box::new(SequentialSealerBidMaker::new(
-                Arc::from(finished_block_sink),
-                cancel.clone(),
-            ))
-        } else {
-            Box::new(ParallelSealerBidMaker::new(
-                self.max_concurrent_seals,
-                Arc::from(finished_block_sink),
-                cancel.clone(),
-            ))
-        };
+        let sealer = Box::new(SequentialSealerBidMaker::new(
+            Arc::from(finished_block_sink),
+            cancel.clone(),
+        ));
 
         let slot_bidder: Arc<dyn SlotBidder> = self.bidding_service.create_slot_bidder(
             slot_data.block(),
@@ -140,12 +129,13 @@ where
 
 /// Helper object containing the bidder.
 /// It just forwards new blocks and new competitions bids (via SlotBidderToBidValueObs) to the bidder.
-#[derive(Debug)]
 struct BlockSealingBidder {
-    /// Bidder we ask how to finish the blocks.
+    /// Used to unsubscribe on drop.
     bid_value_source_to_unsubscribe: Arc<dyn BidValueObs + Send + Sync>,
     /// Used to unsubscribe on drop.
     competition_bid_value_source: Arc<dyn BidValueSource + Send + Sync>,
+    /// We forward best block and competition bids to the bidder.
+    /// It will bid with the BidMaker it received on creation.
     bidder: Arc<dyn SlotBidder>,
 }
 
@@ -175,13 +165,9 @@ impl BlockSealingBidder {
 }
 
 impl UnfinishedBlockBuildingSink for BlockSealingBidder {
-    fn new_block(
-        &self,
-        block: Box<dyn crate::building::builders::block_building_helper::BlockBuildingHelper>,
-    ) {
-        self.bidder.new_block(block);
+    fn new_block(&self, biddable_block: BiddableUnfinishedBlock) {
+        self.bidder.new_block(biddable_block);
     }
-
     fn can_use_suggested_fee_recipient_as_coinbase(&self) -> bool {
         self.bidder.can_use_suggested_fee_recipient_as_coinbase()
     }
@@ -191,5 +177,11 @@ impl Drop for BlockSealingBidder {
     fn drop(&mut self) {
         self.competition_bid_value_source
             .unsubscribe(self.bid_value_source_to_unsubscribe.clone());
+    }
+}
+
+impl Debug for BlockSealingBidder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockSealingBidder").finish()
     }
 }

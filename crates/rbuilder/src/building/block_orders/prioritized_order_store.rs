@@ -7,6 +7,7 @@ use priority_queue::PriorityQueue;
 use crate::{
     building::Sorting,
     primitives::{AccountNonce, Nonce, OrderId, SimulatedOrder},
+    telemetry::mark_order_not_ready_for_immediate_inclusion,
 };
 
 use super::SimulatedOrderSink;
@@ -65,7 +66,14 @@ pub struct PrioritizedOrderStore {
 }
 
 impl PrioritizedOrderStore {
-    pub fn new(priority: Sorting, onchain_nonces: HashMap<Address, u64>) -> Self {
+    pub fn new(
+        priority: Sorting,
+        initial_onchain_nonces: impl IntoIterator<Item = AccountNonce>,
+    ) -> Self {
+        let mut onchain_nonces = HashMap::default();
+        for onchain_nonce in initial_onchain_nonces {
+            onchain_nonces.insert(onchain_nonce.account, onchain_nonce.nonce);
+        }
         Self {
             main_queue: PriorityQueue::new(),
             main_queue_nonces: HashMap::default(),
@@ -118,7 +126,6 @@ impl PrioritizedOrderStore {
 
         for order_id in invalidated_orders {
             // check if order can still be valid because of optional nonces
-
             self.main_queue.remove(&order_id);
             let order = self
                 .remove_poped_order(&order_id)
@@ -144,13 +151,11 @@ impl PrioritizedOrderStore {
                 }
             }
             let retain_order = valid && valid_nonces > 0;
-            tracing::trace!(
-                "invalidated order: {:?}, retain: {}",
-                order_id,
-                retain_order
-            );
+            tracing::trace!(order = ?order_id, retain_order, "invalidated order");
             if retain_order {
                 self.insert_order(order);
+            } else {
+                mark_order_not_ready_for_immediate_inclusion(&order_id);
             }
         }
 

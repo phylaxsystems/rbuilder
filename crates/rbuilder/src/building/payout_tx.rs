@@ -5,7 +5,7 @@ use alloy_consensus::{constants::KECCAK_EMPTY, TxEip1559};
 use alloy_primitives::{Address, TxKind as TransactionKind, U256};
 use reth_chainspec::ChainSpec;
 use reth_errors::ProviderError;
-use reth_primitives::{transaction::FillTxEnv, Transaction, TransactionSignedEcRecovered};
+use reth_primitives::{transaction::FillTxEnv, Recovered, Transaction, TransactionSigned};
 use revm_primitives::{EVMError, Env, ExecutionResult, TxEnv};
 
 pub fn create_payout_tx(
@@ -16,7 +16,7 @@ pub fn create_payout_tx(
     to: Address,
     gas_limit: u64,
     value: u128,
-) -> Result<TransactionSignedEcRecovered, secp256k1::Error> {
+) -> Result<Recovered<TransactionSigned>, secp256k1::Error> {
     let tx = Transaction::Eip1559(TxEip1559 {
         chain_id: chain_spec.chain.id(),
         nonce,
@@ -31,7 +31,7 @@ pub fn create_payout_tx(
     signer.sign_tx(tx)
 }
 
-#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub enum PayoutTxErr {
     #[error("Reth error: {0}")]
     Reth(#[from] ProviderError),
@@ -53,13 +53,13 @@ pub fn insert_test_payout_tx(
 
     let nonce = state.nonce(builder_signer.address)?;
 
-    let mut cfg = ctx.initialized_cfg.clone();
+    let mut cfg = ctx.evm_env.cfg_env.clone();
     // disable balance check so we can estimate the gas cost without having any funds
     cfg.disable_balance_check = true;
 
     let tx = create_payout_tx(
         ctx.chain_spec.as_ref(),
-        ctx.block_env.basefee,
+        ctx.evm_env.block_env.basefee,
         builder_signer,
         nonce,
         to,
@@ -68,12 +68,11 @@ pub fn insert_test_payout_tx(
     )?;
 
     let mut tx_env = TxEnv::default();
-    let tx_signed = tx.clone().into_signed();
-    tx_signed.fill_tx_env(&mut tx_env, tx_signed.recover_signer().unwrap());
+    tx.fill_tx_env(&mut tx_env, tx.signer());
 
     let env = Env {
-        cfg: cfg.cfg_env.clone(),
-        block: ctx.block_env.clone(),
+        cfg: cfg.clone(),
+        block: ctx.evm_env.block_env.clone(),
         tx: tx_env,
     };
 
@@ -95,7 +94,7 @@ pub fn insert_test_payout_tx(
     }
 }
 
-#[derive(Debug, thiserror::Error, Eq, PartialEq)]
+#[derive(Debug, thiserror::Error)]
 pub enum EstimatePayoutGasErr {
     #[error("Reth error: {0}")]
     Reth(#[from] ProviderError),
@@ -116,6 +115,7 @@ pub fn estimate_payout_gas_limit(
     }
 
     let gas_left = ctx
+        .evm_env
         .block_env
         .gas_limit
         .checked_sub(U256::from(gas_used))

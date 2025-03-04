@@ -2,7 +2,9 @@ use super::interfaces::{
     Bid, BidMaker, BiddingService, BiddingServiceWinControl, LandedBlockInfo, SlotBidder,
 };
 use crate::{
-    building::builders::{block_building_helper::BlockBuildingHelper, UnfinishedBlockBuildingSink},
+    building::builders::{
+        block_building_helper::BiddableUnfinishedBlock, UnfinishedBlockBuildingSink,
+    },
     live_builder::block_output::bid_value_source::interfaces::BidValueObs,
 };
 use alloy_primitives::U256;
@@ -56,16 +58,14 @@ struct TrueBlockValueBidder {
 impl SlotBidder for TrueBlockValueBidder {}
 
 impl UnfinishedBlockBuildingSink for TrueBlockValueBidder {
-    fn new_block(&self, block: Box<dyn BlockBuildingHelper>) {
+    fn new_block(&self, block: BiddableUnfinishedBlock) {
         let payout_tx_value = if block.can_add_payout_tx() {
-            match block.true_block_value() {
-                Ok(tbv) => Some(tbv),
-                Err(_) => return,
-            }
+            Some(block.true_block_value())
         } else {
             None
         };
-        self.bid_maker.send_bid(Bid::new(block, payout_tx_value));
+        self.bid_maker
+            .send_bid(Bid::new(block, payout_tx_value, None));
     }
 
     fn can_use_suggested_fee_recipient_as_coinbase(&self) -> bool {

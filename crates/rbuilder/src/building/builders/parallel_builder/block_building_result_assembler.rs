@@ -5,26 +5,27 @@ use super::{
 use ahash::HashMap;
 use alloy_primitives::utils::format_ether;
 use reth::revm::cached::CachedReads;
-use reth_db::Database;
-use reth_provider::{BlockReader, DatabaseProviderFactory, StateProviderFactory};
-use std::{marker::PhantomData, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
-use tracing::{trace, warn};
+use tracing::{info_span, trace};
 
 use crate::{
     building::{
         builders::{
-            block_building_helper::{BlockBuildingHelper, BlockBuildingHelperFromProvider},
-            UnfinishedBlockBuildingSink,
+            block_building_helper::{
+                BiddableUnfinishedBlock, BlockBuildingHelper, BlockBuildingHelperFromProvider,
+            },
+            handle_building_error, UnfinishedBlockBuildingSink,
         },
         BlockBuildingContext,
     },
-    roothash::RootHashConfig,
+    provider::StateProviderFactory,
+    telemetry::mark_builder_considers_order,
 };
 
 /// Assembles block building results from the best orderings of order groups.
-pub struct BlockBuildingResultAssembler<P, DB> {
+pub struct BlockBuildingResultAssembler<P> {
     provider: P,
     ctx: BlockBuildingContext,
     cancellation_token: CancellationToken,
@@ -32,22 +33,16 @@ pub struct BlockBuildingResultAssembler<P, DB> {
     discard_txs: bool,
     coinbase_payment: bool,
     can_use_suggested_fee_recipient_as_coinbase: bool,
-    root_hash_config: RootHashConfig,
     builder_name: String,
     sink: Option<Arc<dyn UnfinishedBlockBuildingSink>>,
     best_results: Arc<BestResults>,
     run_id: u64,
     last_version: Option<u64>,
-    phantom: PhantomData<DB>,
 }
 
-impl<P, DB> BlockBuildingResultAssembler<P, DB>
+impl<P> BlockBuildingResultAssembler<P>
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + Clone
-        + 'static,
+    P: StateProviderFactory + Clone + 'static,
 {
     /// Creates a new `BlockBuildingResultAssembler`.
     ///
@@ -60,7 +55,6 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &ParallelBuilderConfig,
-        root_hash_config: RootHashConfig,
         best_results: Arc<BestResults>,
         provider: P,
         ctx: BlockBuildingContext,
@@ -77,13 +71,11 @@ where
             discard_txs: config.discard_txs,
             coinbase_payment: config.coinbase_payment,
             can_use_suggested_fee_recipient_as_coinbase,
-            root_hash_config,
             builder_name,
             sink,
             best_results,
             run_id: 0,
             last_version: None,
-            phantom: PhantomData,
         }
     }
 
@@ -104,7 +96,9 @@ where
             }
             if self.best_results.get_number_of_orders() > 0 {
                 let orders_closed_at = OffsetDateTime::now_utc();
-                self.try_build_block(orders_closed_at);
+                if !self.try_build_block(orders_closed_at) {
+                    break;
+                }
             }
         }
         trace!(
@@ -113,12 +107,12 @@ where
         );
     }
 
-    /// Attempts to build a new block if not already building.
+    /// Attempts to build a new block if not already building. Returns if block building should continue.
     ///
     /// # Arguments
     ///
     /// * `orders_closed_at` - The timestamp when orders were closed.
-    fn try_build_block(&mut self, orders_closed_at: OffsetDateTime) {
+    fn try_build_block(&mut self, orders_closed_at: OffsetDateTime) -> bool {
         let time_start = Instant::now();
 
         let current_best_results = self.best_results.clone();
@@ -128,7 +122,7 @@ where
         // Check if version has incremented
         if let Some(last_version) = self.last_version {
             if version == last_version {
-                return;
+                return true;
             }
         }
         self.last_version = Some(version);
@@ -140,18 +134,18 @@ where
         );
 
         if best_orderings_per_group.is_empty() {
-            return;
+            return true;
         }
 
         match self.build_new_block(&mut best_orderings_per_group, orders_closed_at) {
             Ok(new_block) => {
                 if let Ok(value) = new_block.true_block_value() {
                     trace!(
-                        "Parallel builder run id {}: Built new block with results version {:?} and profit: {:?} in {:?} ms",
-                        self.run_id,
-                        version,
-                        format_ether(value),
-                        time_start.elapsed().as_millis()
+                        run_id = self.run_id,
+                        version = version,
+                        time_ms = time_start.elapsed().as_millis(),
+                        profit = format_ether(value),
+                        "Parallel builder built new block",
                     );
 
                     if new_block.built_block_trace().got_no_signer_error {
@@ -159,15 +153,21 @@ where
                     }
 
                     if let Some(sink) = &self.sink {
-                        sink.new_block(new_block);
+                        if let Ok(new_block) = BiddableUnfinishedBlock::new(new_block) {
+                            sink.new_block(new_block);
+                        }
                     }
                 }
             }
-            Err(e) => {
-                warn!("Parallel builder run id {}: Failed to build new block with results version {:?}: {:?}", self.run_id, version, e);
+            Err(err) => {
+                let _span = info_span!("Parallel builder failed to build new block",run_id = self.run_id,version = version,err=?err).entered();
+                if !handle_building_error(err) {
+                    return false;
+                }
             }
         }
         self.run_id += 1;
+        true
     }
 
     /// Builds a new block using the best results from each group.
@@ -199,7 +199,6 @@ where
 
         let mut block_building_helper = BlockBuildingHelperFromProvider::new(
             self.provider.clone(),
-            self.root_hash_config.clone(),
             ctx,
             self.cached_reads.clone(),
             self.builder_name.clone(),
@@ -229,6 +228,11 @@ where
                 let (order_idx, _) = sequence_of_orders.sequence_of_orders.remove(0);
                 let sim_order = &order_group.orders[order_idx];
 
+                mark_builder_considers_order(
+                    sim_order.id(),
+                    &block_building_helper.built_block_trace().orders_closed_at,
+                    block_building_helper.builder_name(),
+                );
                 let start_time = Instant::now();
                 let commit_result = block_building_helper.commit_order(sim_order)?;
                 let order_commit_time = start_time.elapsed();
@@ -267,7 +271,6 @@ where
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
         let mut block_building_helper = BlockBuildingHelperFromProvider::new(
             self.provider.clone(),
-            self.root_hash_config.clone(), // Adjust as needed for backtest
             self.ctx.clone(),
             None, // No cached reads for backtest start
             String::from("backtest_builder"),

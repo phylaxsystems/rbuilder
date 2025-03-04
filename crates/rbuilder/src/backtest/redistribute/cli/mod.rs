@@ -5,14 +5,17 @@ use crate::{
         redistribute::{calc_redistributions, RedistributionBlockOutput},
         BlockData, HistoricalDataStorage,
     },
-    live_builder::{base_config::load_config_toml_and_env, cli::LiveBuilderConfig},
+    live_builder::{
+        base_config::load_config_toml_and_env, block_list_provider::BlockList,
+        cli::LiveBuilderConfig,
+    },
+    provider::StateProviderFactory,
 };
 use alloy_primitives::utils::format_ether;
 use clap::Parser;
 use csv_output::{CSVOutputRow, CSVResultWriter};
-use reth_db::Database;
-use reth_provider::{BlockReader, DatabaseProviderFactory, HeaderProvider, StateProviderFactory};
 use std::{io, path::PathBuf};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -54,10 +57,16 @@ where
     let config: ConfigType = load_config_toml_and_env(cli.config)?;
     config.base_config().setup_tracing_subscriber()?;
 
+    let blocklist = config
+        .base_config()
+        .blocklist_provider(CancellationToken::new())
+        .await?
+        .get_blocklist()?;
+
     let mut historical_data_storage =
         HistoricalDataStorage::new_from_path(&config.base_config().backtest_fetch_output_file)
             .await?;
-    let provider = config.base_config().create_provider_factory()?;
+    let provider = config.base_config().create_provider_factory(true)?;
     let mut csv_writer = cli
         .csv
         .map(|path| -> io::Result<_> { CSVResultWriter::new(path) })
@@ -77,6 +86,7 @@ where
                 provider.clone(),
                 &config,
                 cli.distribute_to_mempool_txs,
+                blocklist,
             )?;
         }
         Commands::Range {
@@ -94,6 +104,7 @@ where
                     provider.clone(),
                     &config,
                     cli.distribute_to_mempool_txs,
+                    blocklist.clone(),
                 )?;
             }
         }
@@ -107,21 +118,17 @@ where
     Ok(())
 }
 
-fn process_redisribution<P, DB, ConfigType>(
+fn process_redisribution<P, ConfigType>(
     block_data: BlockData,
     csv_writer: Option<&mut CSVResultWriter>,
     json_accum: Option<&mut Vec<RedistributionBlockOutput>>,
     provider: P,
     config: &ConfigType,
     distribute_to_mempool_txs: bool,
+    blocklist: BlockList,
 ) -> eyre::Result<()>
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB = DB, Provider: BlockReader>
-        + StateProviderFactory
-        + HeaderProvider
-        + Clone
-        + 'static,
+    P: StateProviderFactory + Clone + 'static,
     ConfigType: LiveBuilderConfig,
 {
     let block_number = block_data.block_number;
@@ -132,6 +139,7 @@ where
         config,
         block_data,
         distribute_to_mempool_txs,
+        blocklist,
     ) {
         Ok(ok) => ok,
         Err(err) => {

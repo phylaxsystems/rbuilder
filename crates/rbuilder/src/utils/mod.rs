@@ -1,4 +1,5 @@
 //! a2r prefix = alloy to reth conversion
+pub mod bls;
 pub mod build_info;
 pub mod constants;
 pub mod error_storage;
@@ -9,14 +10,13 @@ pub mod reconnect;
 mod test_data_generator;
 mod tx_signer;
 
+pub mod provider_head_state;
 #[cfg(test)]
 pub mod test_utils;
 pub mod tracing;
 
-use alloy_network::Ethereum;
 use alloy_primitives::{Address, Sign, I256, U256};
 use alloy_provider::RootProvider;
-use alloy_transport::BoxTransport;
 
 use crate::primitives::{
     serialize::{RawTx, TxEncoding},
@@ -26,12 +26,12 @@ use alloy_consensus::TxEnvelope;
 use alloy_eips::eip2718::Encodable2718;
 pub use noncer::{NonceCache, NonceCacheRef};
 pub use provider_factory_reopen::{
-    check_provider_factory_health, is_provider_factory_health_error, ProviderFactoryReopener,
+    check_block_hash_reader_health, is_provider_factory_health_error, HistoricalBlockError,
+    ProviderFactoryReopener, RootHasherImpl,
 };
 use reth_chainspec::ChainSpec;
-use reth_evm_ethereum::revm_spec_by_timestamp_after_merge;
+use reth_evm_ethereum::revm_spec_by_timestamp_and_block_number;
 use revm_primitives::{CfgEnv, CfgEnvWithHandlerCfg};
-use std::cmp::{max, min};
 pub use test_data_generator::TestDataGenerator;
 use time::OffsetDateTime;
 pub use tx_signer::Signer;
@@ -61,10 +61,8 @@ pub mod u256decimal_serde_helper {
     }
 }
 
-pub type BoxedProvider = RootProvider<BoxTransport, Ethereum>;
-
-pub fn http_provider(url: reqwest::Url) -> BoxedProvider {
-    RootProvider::new_http(url).boxed()
+pub fn http_provider(url: reqwest::Url) -> RootProvider {
+    RootProvider::new_http(url)
 }
 
 #[cfg(test)]
@@ -111,13 +109,14 @@ pub fn gen_uid() -> u64 {
 
 pub fn default_cfg_env(
     chain: &ChainSpec,
-    block_timestamp_after_merge: u64,
+    block_timestamp: u64,
+    block_number: u64,
 ) -> CfgEnvWithHandlerCfg {
     let mut cfg = CfgEnv::default();
     cfg.chain_id = chain.chain().id();
     CfgEnvWithHandlerCfg::new_with_spec_id(
         cfg,
-        revm_spec_by_timestamp_after_merge(chain, block_timestamp_after_merge),
+        revm_spec_by_timestamp_and_block_number(chain, block_timestamp, block_number),
     )
 }
 
@@ -126,46 +125,6 @@ pub fn unix_timestamp_now() -> u64 {
         .unix_timestamp()
         .try_into()
         .unwrap_or_default()
-}
-
-pub fn calc_gas_limit(parent: u64, desired_limit: u64) -> u64 {
-    /* port of this fuction from geth builder
-    func CalcGasLimit(parentGasLimit, desiredLimit uint64) uint64 {
-        delta := parentGasLimit/params.GasLimitBoundDivisor - 1
-        limit := parentGasLimit
-        if desiredLimit < params.MinGasLimit {
-            desiredLimit = params.MinGasLimit
-        }
-        // If we're outside our allowed gas range, we try to hone towards them
-        if limit < desiredLimit {
-            limit = parentGasLimit + delta
-            if limit > desiredLimit {
-                limit = desiredLimit
-            }
-            return limit
-        }
-        if limit > desiredLimit {
-            limit = parentGasLimit - delta
-            if limit < desiredLimit {
-                limit = desiredLimit
-            }
-        }
-        return limit
-    }
-    */
-    let delta = parent / 1024 - 1;
-
-    let desired_limit = max(desired_limit, 5000);
-
-    if parent < desired_limit {
-        return min(parent + delta, desired_limit);
-    }
-
-    if parent > desired_limit {
-        return max(parent - delta, desired_limit);
-    }
-
-    parent
 }
 
 pub fn int_percentage(value: u64, percentage: usize) -> u64 {
@@ -210,7 +169,7 @@ pub fn find_suggested_fee_recipient(
     block: &alloy_rpc_types::Block,
     txs: &[TransactionSignedEcRecoveredWithBlobs],
 ) -> Address {
-    let coinbase = block.header.miner;
+    let coinbase = block.header.beneficiary;
     let (last_tx_signer, last_tx_to) = if let Some((signer, to)) = txs
         .last()
         .map(|tx| (tx.signer(), tx.to().unwrap_or_default()))
@@ -232,7 +191,8 @@ pub fn extract_onchain_block_txs(
 ) -> eyre::Result<Vec<TransactionSignedEcRecoveredWithBlobs>> {
     let mut result = Vec::new();
     for tx in onchain_block.transactions.clone().into_transactions() {
-        let tx_envelope: TxEnvelope = tx.try_into()?;
+        let tx_envelope: TxEnvelope =
+            <alloy_rpc_types_eth::Transaction as Into<TxEnvelope>>::into(tx);
         let encoded = tx_envelope.encoded_2718();
         let tx = RawTx { tx: encoded.into() }.decode(TxEncoding::NoBlobData)?;
         result.push(tx.tx_with_blobs);
@@ -243,6 +203,7 @@ pub fn extract_onchain_block_txs(
 #[cfg(test)]
 mod test {
     use super::*;
+    use alloy_eips::eip1559::calculate_block_gas_limit;
     use serde::{Deserialize, Serialize};
 
     #[test]
@@ -291,7 +252,7 @@ mod test {
         ];
 
         for test in tests {
-            let result = calc_gas_limit(test.parent, test.desired);
+            let result = calculate_block_gas_limit(test.parent, test.desired);
             assert_eq!(result, test.result);
         }
     }

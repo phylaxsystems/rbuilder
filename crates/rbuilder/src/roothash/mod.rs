@@ -1,15 +1,21 @@
 mod prefetcher;
 
+use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
-use eth_sparse_mpt::reth_sparse_trie::{
-    calculate_root_hash_with_sparse_trie, trie_fetcher::FetchNodeError, SparseTrieError,
-    SparseTrieSharedCache,
+use eth_sparse_mpt::{
+    reth_sparse_trie::{
+        calculate_root_hash_with_sparse_trie, trie_fetcher::FetchNodeError, SparseTrieError,
+        SparseTrieSharedCache,
+    },
+    RootHashThreadPool,
 };
 use reth::providers::{providers::ConsistentDbView, ExecutionOutcome};
 use reth_errors::ProviderError;
-use reth_provider::{BlockReader, DatabaseProviderFactory};
+use reth_provider::{
+    BlockReader, DatabaseProviderFactory, HashedPostStateProvider, StateCommitmentProvider,
+};
 use reth_trie::TrieInput;
-use reth_trie_parallel::parallel_root::{ParallelStateRoot, ParallelStateRootError};
+use reth_trie_parallel::root::{ParallelStateRoot, ParallelStateRootError};
 use tracing::trace;
 
 pub use prefetcher::run_trie_prefetcher;
@@ -22,9 +28,6 @@ pub enum RootHashMode {
     /// Makes correct root hash calculation on the incorrect parent state.
     /// It can be used for benchmarks.
     IgnoreParentHash,
-    /// Don't calculate root hash.
-    /// It can be used for backtest.
-    SkipRootHash,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -54,39 +57,43 @@ impl RootHashError {
 }
 
 #[derive(Debug, Clone)]
-pub struct RootHashConfig {
+pub struct RootHashContext {
     pub mode: RootHashMode,
     pub use_sparse_trie: bool,
     pub compare_sparse_trie_output: bool,
+    pub thread_pool: Option<RootHashThreadPool>,
 }
 
-impl RootHashConfig {
-    pub fn skip_root_hash() -> Self {
-        Self {
-            mode: RootHashMode::SkipRootHash,
-            use_sparse_trie: false,
-            compare_sparse_trie_output: false,
-        }
-    }
-
-    pub fn live_config(use_sparse_trie: bool, compare_sparse_trie_output: bool) -> Self {
+impl RootHashContext {
+    pub fn new(
+        use_sparse_trie: bool,
+        compare_sparse_trie_output: bool,
+        thread_pool: Option<RootHashThreadPool>,
+    ) -> Self {
         Self {
             mode: RootHashMode::CorrectRoot,
             use_sparse_trie,
             compare_sparse_trie_output,
+            thread_pool,
         }
     }
 }
 
-fn calculate_parallel_root_hash<P>(
+fn calculate_parallel_root_hash<P, HasherType>(
+    hasher: &HasherType,
     outcome: &ExecutionOutcome,
     consistent_db_view: ConsistentDbView<P>,
 ) -> Result<B256, ParallelStateRootError>
 where
-    P: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync + Clone + 'static,
+    HasherType: HashedPostStateProvider,
+    P: DatabaseProviderFactory<Provider: BlockReader>
+        + StateCommitmentProvider
+        + Send
+        + Sync
+        + Clone
+        + 'static,
 {
-    let hashed_post_state = outcome.hash_state_slow();
-
+    let hashed_post_state = hasher.hashed_post_state(outcome.state());
     let parallel_root_calculator = ParallelStateRoot::new(
         consistent_db_view.clone(),
         TrieInput::from_state(hashed_post_state),
@@ -95,27 +102,41 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn calculate_state_root<P>(
+pub fn calculate_state_root<P, HasherType>(
     provider: P,
-    parent_hash: B256,
+    hasher: &HasherType,
+    parent_num_hash: BlockNumHash,
     outcome: &ExecutionOutcome,
     sparse_trie_shared_cache: SparseTrieSharedCache,
-    config: RootHashConfig,
+    config: &RootHashContext,
 ) -> Result<B256, RootHashError>
 where
-    P: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync + Clone + 'static,
+    HasherType: HashedPostStateProvider,
+    P: DatabaseProviderFactory<Provider: BlockReader>
+        + Send
+        + Sync
+        + Clone
+        + StateCommitmentProvider
+        + 'static,
 {
     let consistent_db_view = match config.mode {
-        RootHashMode::CorrectRoot => ConsistentDbView::new(provider, Some(parent_hash)),
-        RootHashMode::IgnoreParentHash => ConsistentDbView::new_with_latest_tip(provider)
+        RootHashMode::CorrectRoot => ConsistentDbView::new(
+            provider.clone(),
+            Some((parent_num_hash.hash, parent_num_hash.number)),
+        ),
+        RootHashMode::IgnoreParentHash => ConsistentDbView::new_with_latest_tip(provider.clone())
             .map_err(ParallelStateRootError::Provider)?,
-        RootHashMode::SkipRootHash => {
-            return Ok(B256::ZERO);
-        }
     };
 
     let reference_root_hash = if config.compare_sparse_trie_output {
-        calculate_parallel_root_hash(outcome, consistent_db_view.clone())?
+        // parallel root hash uses rayon
+        if let Some(thread_pool) = &config.thread_pool {
+            thread_pool.rayon_pool.install(|| {
+                calculate_parallel_root_hash(hasher, outcome, consistent_db_view.clone())
+            })?
+        } else {
+            calculate_parallel_root_hash(hasher, outcome, consistent_db_view.clone())?
+        }
     } else {
         B256::ZERO
     };
@@ -125,11 +146,12 @@ where
             consistent_db_view,
             outcome,
             sparse_trie_shared_cache,
+            &config.thread_pool,
         );
         trace!(?metrics, "Sparse trie metrics");
         root?
     } else {
-        calculate_parallel_root_hash(outcome, consistent_db_view)?
+        calculate_parallel_root_hash(hasher, outcome, consistent_db_view)?
     };
 
     if config.compare_sparse_trie_output && reference_root_hash != root {

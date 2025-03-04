@@ -1,6 +1,7 @@
 use alloy_consensus::TxLegacy;
 use alloy_primitives::B256;
-use reth_primitives::{Transaction, TransactionSigned, TransactionSignedEcRecovered};
+use reth_primitives::{Recovered, Transaction, TransactionSigned};
+use revm_primitives::PrimitiveSignature;
 use uuid::Uuid;
 
 use super::{
@@ -17,20 +18,20 @@ pub struct TestDataGenerator {
 }
 
 impl TestDataGenerator {
-    pub fn create_tx(&mut self) -> TransactionSignedEcRecovered {
+    pub fn create_tx(&mut self) -> Recovered<TransactionSigned> {
         self.create_tx_nonce(AccountNonce::default())
     }
 
-    pub fn create_tx_nonce(&mut self, sender_nonce: AccountNonce) -> TransactionSignedEcRecovered {
-        TransactionSignedEcRecovered::from_signed_transaction(
-            TransactionSigned {
-                hash: self.base.create_tx_hash(),
-                transaction: Transaction::Legacy(TxLegacy {
+    pub fn create_tx_nonce(&mut self, sender_nonce: AccountNonce) -> Recovered<TransactionSigned> {
+        Recovered::new_unchecked(
+            TransactionSigned::new(
+                Transaction::Legacy(TxLegacy {
                     nonce: sender_nonce.nonce,
                     ..TxLegacy::default()
                 }),
-                ..Default::default()
-            },
+                PrimitiveSignature::test_signature(),
+                self.base.create_tx_hash(),
+            ),
             sender_nonce.account,
         )
     }
@@ -51,7 +52,7 @@ impl TestDataGenerator {
         replacement_data: Option<BundleReplacementData>,
     ) -> Bundle {
         let mut res = Bundle {
-            block,
+            block: Some(block),
             min_timestamp: None,
             max_timestamp: None,
             txs: vec![self.create_tx_with_blobs_nonce(sender_nonce)],
@@ -59,8 +60,10 @@ impl TestDataGenerator {
             hash: B256::default(),
             uuid: Uuid::default(),
             replacement_data: replacement_data.clone(),
-            signer: replacement_data.map(|r| r.key.key().signer),
+            signer: replacement_data.as_ref().and_then(|r| r.key.key().signer),
             metadata: Default::default(),
+            dropping_tx_hashes: vec![],
+            refund: None,
         };
         res.hash_slow();
         res
@@ -89,7 +92,7 @@ impl TestDataGenerator {
             block,
             max_block: block,
             inner_bundle,
-            signer: replacement_data.as_ref().map(|r| r.key.key().signer),
+            signer: replacement_data.as_ref().and_then(|r| r.key.key().signer),
             replacement_data,
             original_orders: Vec::new(),
             metadata: Default::default(),
@@ -115,7 +118,7 @@ impl TestDataGenerator {
             txs.push(tx1);
         }
         let mut bundle = Bundle {
-            block,
+            block: Some(block),
             min_timestamp: None,
             max_timestamp: None,
             txs,
@@ -123,8 +126,10 @@ impl TestDataGenerator {
             hash: B256::default(),
             uuid: Uuid::default(),
             replacement_data: replacement_data.clone(),
-            signer: replacement_data.map(|r| r.key.key().signer),
+            signer: replacement_data.as_ref().and_then(|r| r.key.key().signer),
             metadata: Default::default(),
+            dropping_tx_hashes: Default::default(),
+            refund: None,
         };
         bundle.hash_slow();
         bundle

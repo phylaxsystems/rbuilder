@@ -11,7 +11,7 @@ To use this, for each parent block:
 * machine with 64 cores, Samsung 980Pro SSD
 
 We calculate root hash of some specific blocks in a loop using the same changes.
-This implemenation caches only disk access, all storage and main trie hashes are calculated fully on each iteration.
+This implementation caches only disk access, all storage and main trie hashes are calculated fully on each iteration.
 
 ```
 reth parallel root hash:
@@ -21,6 +21,6 @@ next iterations: 140 ms (median, stable)
 
 eth-sparse-mpt:
 
-first iteraton : 225 ms
+first iteration : 225 ms
 next iterations: 5.1 ms (median, stable)
 ```

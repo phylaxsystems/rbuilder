@@ -7,10 +7,14 @@ use alloy_primitives::{Bytes, B256};
 use alloy_rlp::Encodable;
 use rayon::prelude::*;
 use reth_trie::TrieAccount;
+use serde::{Deserialize, Serialize};
+use serde_with::{serde_as, Seq};
 
-#[derive(Default, Clone)]
+#[serde_as]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EthSparseTries {
     pub account_trie: DiffTrie,
+    #[serde_as(as = "Seq<(_, _)>")]
     pub storage_tries: HashMap<Bytes, DiffTrie>,
 }
 
@@ -72,7 +76,12 @@ impl EthSparseTries {
             let hash = account_hashes
                 .remove(&account)
                 .expect("account hash not found");
-            let trie_account: TrieAccount = (updated_info, hash).into();
+            let trie_account: TrieAccount = TrieAccount {
+                nonce: updated_info.nonce,
+                balance: updated_info.balance,
+                storage_root: hash,
+                code_hash: updated_info.code_hash,
+            };
             encoded_account.clear();
             trie_account.encode(&mut encoded_account);
 

@@ -6,7 +6,9 @@
 /scripts/benchmark-results.*
 /test/
 /integration_logs
+genesis.json
 
 # editors
 .code
 .idea
+.vscode
